@@ -1,0 +1,5 @@
+.gradle/
+build/
+ide-plugin/.gradle/
+ide-plugin/build/
+ide-plugin/.intellijPlatform/

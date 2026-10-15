@@ -1,0 +1,14 @@
+<idea-plugin>
+    <id>dev.asdbg.bridge</id>
+    <name>Android Debug Bridge</name>
+    <vendor>local</vendor>
+    <description>Localhost API for the Android Studio debugger session this IDE already owns.</description>
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.lang</depends>
+    <depends>com.intellij.modules.xdebugger</depends>
+    <depends>org.jetbrains.android</depends>
+    <idea-version since-build="262.9437" until-build="262.*"/>
+    <applicationListeners>
+        <listener class="dev.asdbg.BridgeStartup" topic="com.intellij.ide.AppLifecycleListener"/>
+    </applicationListeners>
+</idea-plugin>
