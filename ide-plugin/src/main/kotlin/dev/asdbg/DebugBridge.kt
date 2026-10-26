@@ -587,13 +587,24 @@ private object BridgeServer {
         val action = json.str("action") ?: throw ApiException(400, "action is required")
         val timeout = json.long("timeout") ?: 60_000L
         val session = requireSession(project, id)
+        val sessionId = sessions.idOf(session)
+        val extra = mutableMapOf<String, Any?>()
         val lock = sessions.lock(session)
         synchronized(lock) {
             when (action) {
                 "PAUSE" -> edt { session.pause() }
                 "RESUME" -> {
-                    if (!session.isSuspended) throw ApiException(409, "session is running")
-                    edt { session.resume() }
+                    if (session.isSuspended) {
+                        edt { session.resume() }
+                    } else {
+                        val resumed = JavaDebug.resumeThreads(session)
+                        if (resumed.isNullOrEmpty()) throw ApiException(409, "session is running")
+                        extra["resumed"] = resumed
+                    }
+                }
+                "RESUME_VM" -> {
+                    if (!JavaDebug.resumeVm(session)) throw ApiException(409, "not a Java debug session")
+                    extra["vmResumed"] = true
                 }
                 "STEP_OVER" -> {
                     if (!session.isSuspended) throw ApiException(409, "session is running")
@@ -614,31 +625,44 @@ private object BridgeServer {
         }
         return mapOf(
             "action" to action,
-            "sessionId" to sessions.idOf(session),
+            "sessionId" to sessionId,
             "suspended" to (safe { session.isSuspended } ?: false),
-        )
+        ) + extra
     }
 
+    // A suspend=thread stop may leave the XDebugSession running, so also poll the Java suspend contexts.
     private fun waitPause(session: XDebugSession, timeoutMs: Long): Map<String, Any?> {
         val id = sessions.idOf(session)
-        if (safe { session.isSuspended } == true) return pausedEvent(session, id)
+        pausedNow(session, id)?.let { return it }
         val future = CompletableFuture<String>()
         sessions.addWaiter(session, future)
-        if (safe { session.isSuspended } == true) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        try {
+            while (true) {
+                pausedNow(session, id)?.let { return it }
+                val left = deadline - System.currentTimeMillis()
+                if (left <= 0) return mapOf("event" to "timeout", "sessionId" to id)
+                val event = try {
+                    future.get(minOf(left, 500L), TimeUnit.MILLISECONDS)
+                } catch (_: TimeoutException) {
+                    continue
+                }
+                return when (event) {
+                    "paused" -> pausedEvent(session, id)
+                    "stopped" -> mapOf("event" to "stopped", "sessionId" to id)
+                    else -> mapOf("event" to "timeout", "sessionId" to id)
+                }
+            }
+        } finally {
             sessions.removeWaiter(session, future)
-            return pausedEvent(session, id)
         }
-        val event = try {
-            future.get(timeoutMs, TimeUnit.MILLISECONDS)
-        } catch (_: TimeoutException) {
-            sessions.removeWaiter(session, future)
-            "timeout"
-        }
-        return when (event) {
-            "paused" -> pausedEvent(session, id)
-            "stopped" -> mapOf("event" to "stopped", "sessionId" to id)
-            else -> mapOf("event" to "timeout", "sessionId" to id)
-        }
+    }
+
+    private fun pausedNow(session: XDebugSession, id: String): Map<String, Any?>? {
+        if (safe { session.isSuspended } == true) return pausedEvent(session, id)
+        val threads = JavaDebug.suspendedThreads(session)
+        if (threads.isNullOrEmpty()) return null
+        return pausedEvent(session, id) + mapOf("threadLevel" to true, "suspendedThreads" to threads)
     }
 
     private fun stack(project: Project, id: String): List<Map<String, Any?>> {
@@ -779,12 +803,17 @@ private object BridgeServer {
         return sessions.get(id) ?: throw ApiException(404, "session not found")
     }
 
-    private fun sessionDto(session: XDebugSession): Map<String, Any?> = mapOf(
-        "id" to sessions.idOf(session),
-        "name" to session.sessionName,
-        "suspended" to (safe { session.isSuspended } ?: false),
-        "position" to position(session),
-    )
+    private fun sessionDto(session: XDebugSession): Map<String, Any?> {
+        val threads = JavaDebug.suspendedThreads(session)
+        return mapOf(
+            "id" to sessions.idOf(session),
+            "name" to session.sessionName,
+            "suspended" to (safe { session.isSuspended } ?: false),
+            "threadSuspended" to threads?.isNotEmpty(),
+            "suspendedThreads" to threads,
+            "position" to position(session),
+        )
+    }
 
     private fun pausedEvent(session: XDebugSession, id: String): Map<String, Any?> = mapOf(
         "event" to "paused",
@@ -993,6 +1022,99 @@ private class TextRenderer : XValuePresentation.XValueTextRenderer {
 
     override fun renderError(error: String) {
         buffer.append(error)
+    }
+}
+
+// The Java debugger engine sits in a content module this plugin does not link against,
+// so it is reached by reflection on the live objects. Every call runs on the debugger manager thread.
+private object JavaDebug {
+    private const val TIMEOUT_MS = 3_000L
+
+    /** Suspended contexts that the XDebugSession may not report, e.g. suspend=thread stops. null when unknown. */
+    fun suspendedThreads(session: XDebugSession): List<Map<String, Any?>>? = try {
+        val process = process(session) ?: return null
+        onManager(process) { contexts(process).map { info(it) } }
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Resumes every suspend context the same way the IDE Resume does. Returns what was resumed, null when not Java. */
+    fun resumeThreads(session: XDebugSession): List<Map<String, Any?>>? {
+        val process = process(session) ?: return null
+        return onManager(process) {
+            val manager = call(process, "getManagerThread")!!
+            contexts(process).map { context ->
+                val info = info(context)
+                call(manager, "schedule", call(process, "createResumeCommand", context))
+                info
+            }
+        }
+    }
+
+    /** Last resort: resumes the whole VM. The IDE may still show the old suspend state. */
+    fun resumeVm(session: XDebugSession): Boolean {
+        val process = process(session) ?: return false
+        onManager(process) { call(call(process, "getVirtualMachineProxy")!!, "resume") }
+        return true
+    }
+
+    private fun process(session: XDebugSession): Any? = try {
+        call(session.debugProcess, "getDebuggerSession")?.let { call(it, "getProcess") }
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun contexts(process: Any): List<Any> {
+        val manager = call(process, "getSuspendManager")!!
+        val all = (call(manager, "getEventContexts") as List<*>) + (call(manager, "getPausedContexts") as List<*>)
+        val seen = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>())
+        return all.filterNotNull().filter { seen.add(it) && call(it, "isResumed") != true }
+    }
+
+    private fun info(context: Any): Map<String, Any?> {
+        val thread = call(context, "getEventThread") ?: call(context, "getThread")
+        val policy = when (call(context, "getSuspendPolicy") as? Int) {
+            0 -> "none"
+            1 -> "thread"
+            2 -> "all"
+            else -> "unknown"
+        }
+        return mapOf("thread" to thread?.let { call(it, "name") as? String }, "policy" to policy)
+    }
+
+    private fun <T> onManager(process: Any, block: () -> T): T {
+        val manager = call(process, "getManagerThread")!!
+        val schedule = manager.javaClass.methods.first {
+            it.name == "schedule" && it.parameterCount == 2 && it.parameterTypes[1] == Runnable::class.java
+        }
+        val priority = schedule.parameterTypes[0].enumConstants.first { (it as Enum<*>).name == "NORMAL" }
+        val future = CompletableFuture<T>()
+        schedule.invoke(manager, priority, Runnable {
+            try {
+                future.complete(block())
+            } catch (t: Throwable) {
+                future.completeExceptionally(t)
+            }
+        })
+        return try {
+            future.get(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (_: TimeoutException) {
+            throw ApiException(504, "debugger manager thread did not answer")
+        } catch (e: java.util.concurrent.ExecutionException) {
+            throw e.cause ?: e
+        }
+    }
+
+    private fun call(target: Any, name: String, vararg args: Any?): Any? {
+        val method = target.javaClass.methods.firstOrNull { m ->
+            m.name == name && m.parameterCount == args.size &&
+                m.parameterTypes.indices.all { args[it] == null || m.parameterTypes[it].isInstance(args[it]) }
+        } ?: throw IllegalStateException("no $name on ${target.javaClass.name}")
+        return try {
+            method.invoke(target, *args)
+        } catch (e: java.lang.reflect.InvocationTargetException) {
+            throw e.cause ?: e
+        }
     }
 }
 
