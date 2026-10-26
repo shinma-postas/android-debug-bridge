@@ -11,6 +11,18 @@ from pathlib import Path
 HOME = Path.home() / ".android-debug-bridge"
 ENDPOINT = HOME / "endpoint.json"
 
+SNAPSHOT_PROPS = {
+    "frameIndex": {"type": "integer", "description": "frame index. 0 is the top frame"},
+    "depth": {"type": "integer", "description": "how deep to expand fields. default 2, max 6"},
+    "maxChildren": {"type": "integer", "description": "children per object. default 50"},
+    "maxString": {"type": "integer", "description": "characters per string. default 1000"},
+    "maxNodes": {"type": "integer", "description": "values in total. default 2000"},
+    "thread": {"type": "string", "description": "thread name. default: the thread that stopped"},
+    "snapshotTimeout": {"type": "integer", "description": "milliseconds for reading values. default 10000"},
+    "toString": {"type": "boolean", "description": "also call toString() on this and locals. This runs code in the app. default false"},
+}
+SNAPSHOT_KEYS = tuple(SNAPSHOT_PROPS)
+
 TOOLS = [
     {
         "name": "bp_add",
@@ -82,16 +94,26 @@ TOOLS = [
     },
     {
         "name": "control",
-        "description": "PAUSE, RESUME, RESUME_VM, STEP_OVER, STEP_INTO, STEP_OUT, STOP, or WAIT_FOR_PAUSE. RESUME also resumes suspend=thread stops. RESUME_VM resumes the whole VM as a last resort.",
+        "description": "PAUSE, RESUME, RESUME_VM, STEP_OVER, STEP_INTO, STEP_OUT, STOP, WAIT_FOR_PAUSE, or SNAPSHOT. RESUME also resumes suspend=thread stops. RESUME_VM resumes the whole VM as a last resort. WAIT_FOR_PAUSE with snapshot=true adds the snapshot tool's result when it stops.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {"type": "string"},
                 "sessionId": {"type": "string"},
-                "timeout": {"type": "integer"},
+                "timeout": {"type": "integer", "description": "milliseconds"},
+                "snapshot": {"type": "boolean"},
+                **SNAPSHOT_PROPS,
                 "projectPath": {"type": "string"},
             },
             "required": ["action"],
+        },
+    },
+    {
+        "name": "snapshot",
+        "description": "Everything the IDE debugger shows at the current stop, read-only: thread, file and line, the stack, and this and locals with types and values expanded to depth. Secret-like names are masked. Values can still hold personal or payment data, so do not paste them outside this machine.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"sessionId": {"type": "string"}, **SNAPSHOT_PROPS, "projectPath": {"type": "string"}},
         },
     },
     {
@@ -187,6 +209,10 @@ def session_id(args):
     raise RuntimeError(text if not listed else f"pass sessionId. sessions={text}")
 
 
+def snapshot_body(args):
+    return {key: args[key] for key in SNAPSHOT_KEYS if args.get(key) is not None}
+
+
 def call_tool(name, args):
     project = args.get("projectPath")
     if name == "bp_add":
@@ -231,10 +257,19 @@ def call_tool(name, args):
     if name == "control":
         sid = session_id(args)
         timeout = int(args.get("timeout") or 60000)
-        return bridge("POST", f"/v1/sessions/{sid}/control", {
-            "action": args["action"],
-            "timeout": timeout,
-        }, project, timeout=timeout / 1000 + 5)
+        body = {"action": args["action"], "timeout": timeout}
+        body.update(snapshot_body(args))
+        if args.get("snapshot"):
+            body["snapshot"] = True
+        extra = int(args.get("snapshotTimeout") or 10000) / 1000
+        return bridge("POST", f"/v1/sessions/{sid}/control", body, project,
+                      allow_eval=bool(args.get("toString")), timeout=timeout / 1000 + extra + 5)
+    if name == "snapshot":
+        body = {"action": "SNAPSHOT"}
+        body.update(snapshot_body(args))
+        extra = int(args.get("snapshotTimeout") or 10000) / 1000
+        return bridge("POST", f"/v1/sessions/{session_id(args)}/control", body, project,
+                      allow_eval=bool(args.get("toString")), timeout=extra + 5)
     if name == "stack":
         return bridge("GET", f"/v1/sessions/{session_id(args)}/stack", project=project)
     if name == "variables":
@@ -259,7 +294,7 @@ def handle(message):
             "result": {
                 "protocolVersion": requested,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "android-studio-debug", "version": "0.1.0"},
+                "serverInfo": {"name": "android-studio-debug", "version": "0.1.5"},
             },
         }
     if method == "tools/list":
@@ -284,6 +319,8 @@ def self_check():
     line = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"
     parsed = json.loads(line)
     assert parsed["method"] == "tools/list"
+    assert "snapshot" in [tool["name"] for tool in TOOLS]
+    assert snapshot_body({"depth": 3, "sessionId": "x", "toString": None}) == {"depth": 3}
     print("ok")
 
 

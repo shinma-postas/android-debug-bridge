@@ -13,7 +13,7 @@ from pathlib import Path
 
 HOME = Path.home() / ".android-debug-bridge"
 ENDPOINT = HOME / "endpoint.json"
-ACTIONS = ("PAUSE", "RESUME", "RESUME_VM", "STEP_OVER", "STEP_INTO", "STEP_OUT", "STOP", "WAIT_FOR_PAUSE")
+ACTIONS = ("PAUSE", "RESUME", "RESUME_VM", "STEP_OVER", "STEP_INTO", "STEP_OUT", "STOP", "WAIT_FOR_PAUSE", "SNAPSHOT")
 
 
 def endpoint():
@@ -77,14 +77,15 @@ def only_session(explicit):
 
 def cmd_tools(_):
     print("\n".join([
-        "bp-add", "bp-list", "bp-rm", "bp-clear", "attach", "attach-wait", "restoration-debug", "start", "sessions", "control", "stack", "vars", "eval",
+        "bp-add", "bp-list", "bp-rm", "bp-clear", "attach", "attach-wait", "restoration-debug", "start", "sessions", "control", "snapshot", "stack", "vars", "eval",
     ]))
 
 
 def cmd_schema(args):
     schemas = {
         "xdebug_set_breakpoint": {"file": "app/src/main/java/com/example/MainActivity.kt", "line": 42, "condition": None, "temporary": False},
-        "xdebug_control_session": {"action": "WAIT_FOR_PAUSE", "timeout": 60000},
+        "xdebug_control_session": {"action": "WAIT_FOR_PAUSE", "timeout": 60000, "snapshot": False},
+        "xdebug_snapshot": {"frameIndex": 0, "depth": 2, "maxChildren": 50, "maxString": 1000},
         "bp-add": {"file": "path", "line": 1},
     }
     print(json.dumps(schemas.get(args.name, {"error": "unknown schema", "known": sorted(schemas)}), indent=2))
@@ -315,13 +316,61 @@ def cmd_sessions(_):
     print(json.dumps(request("GET", "/v1/sessions"), indent=2))
 
 
+def snapshot_body(args):
+    body = {
+        "frameIndex": args.frame,
+        "depth": args.depth,
+        "maxChildren": args.max_children,
+        "maxString": args.max_string,
+        "maxNodes": args.max_nodes,
+        "snapshotTimeout": args.snapshot_timeout,
+    }
+    if args.thread:
+        body["thread"] = args.thread
+    if args.to_string:
+        body["toString"] = True
+    return body
+
+
+def add_snapshot_args(cmd):
+    cmd.add_argument("--frame", type=int, default=0, help="frame index. 0 is the top frame")
+    cmd.add_argument("--depth", type=int, default=2, help="how deep to expand fields (0-6)")
+    cmd.add_argument("--max-children", type=int, default=50)
+    cmd.add_argument("--max-string", type=int, default=1000)
+    cmd.add_argument("--max-nodes", type=int, default=2000)
+    cmd.add_argument("--thread", help="thread name. default: the thread that hit the breakpoint")
+    cmd.add_argument("--snapshot-timeout", type=int, default=10000, help="milliseconds for reading values")
+    cmd.add_argument(
+        "--to-string",
+        action="store_true",
+        help="also call toString() on this and locals. This runs code in the app",
+    )
+
+
 def cmd_control(args):
     check_timeout(args.timeout)
     session = only_session(args.session)
-    print(json.dumps(request("POST", f"/v1/sessions/{session}/control", {
-        "action": args.action,
-        "timeout": args.timeout,
-    }, timeout=max(args.timeout / 1000 + 5, 10)), indent=2))
+    body = {"action": args.action, "timeout": args.timeout}
+    wants = args.snapshot or args.action == "SNAPSHOT"
+    if wants:
+        body.update(snapshot_body(args))
+    if args.snapshot:
+        body["snapshot"] = True
+    wait = args.timeout / 1000 + (args.snapshot_timeout / 1000 if wants else 0) + 5
+    print(json.dumps(request(
+        "POST", f"/v1/sessions/{session}/control", body,
+        timeout=max(wait, 10), allow_eval=wants and args.to_string,
+    ), indent=2, ensure_ascii=False))
+
+
+def cmd_snapshot(args):
+    session = only_session(args.session)
+    body = {"action": "SNAPSHOT"}
+    body.update(snapshot_body(args))
+    print(json.dumps(request(
+        "POST", f"/v1/sessions/{session}/control", body,
+        timeout=max(args.snapshot_timeout / 1000 + 5, 10), allow_eval=args.to_string,
+    ), indent=2, ensure_ascii=False))
 
 
 def cmd_stack(args):
@@ -426,8 +475,15 @@ def build_parser():
     )
     control.add_argument("action", choices=ACTIONS)
     control.add_argument("--session")
-    control.add_argument("--timeout", type=int, default=60000)
+    control.add_argument("--timeout", type=int, default=60000, help="milliseconds")
+    control.add_argument("--snapshot", action="store_true", help="WAIT_FOR_PAUSE: add a snapshot when it stops")
+    add_snapshot_args(control)
     control.set_defaults(func=cmd_control)
+
+    snap = sub.add_parser("snapshot", help="file, line, stack, this and locals of the current stop. read-only")
+    snap.add_argument("--session")
+    add_snapshot_args(snap)
+    snap.set_defaults(func=cmd_snapshot)
 
     for name, func in (("stack", cmd_stack), ("vars", cmd_vars)):
         cmd = sub.add_parser(name)
@@ -451,6 +507,11 @@ def self_check():
     args = parser.parse_args(["control", "WAIT_FOR_PAUSE", "--timeout", "1000"])
     assert args.action == "WAIT_FOR_PAUSE" and args.timeout == 1000
     assert parser.parse_args(["control", "RESUME_VM"]).action == "RESUME_VM"
+    args = parser.parse_args(["snapshot", "--frame", "2", "--depth", "3", "--thread", "main"])
+    body = snapshot_body(args)
+    assert body["frameIndex"] == 2 and body["depth"] == 3 and body["thread"] == "main" and "toString" not in body
+    args = parser.parse_args(["control", "WAIT_FOR_PAUSE", "--snapshot", "--to-string"])
+    assert args.snapshot and snapshot_body(args)["toString"] is True
     try:
         cmd_attach(parser.parse_args(["attach", "--serial", "X", "--timeout", "30"]))
     except SystemExit as error:
