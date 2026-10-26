@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -11,7 +12,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-HOME = Path.home() / ".android-debug-bridge"
+HOME = Path(os.environ["ASDBG_HOME"]) if os.environ.get("ASDBG_HOME") else Path.home() / ".android-debug-bridge"
 ENDPOINT = HOME / "endpoint.json"
 ACTIONS = (
     "PAUSE", "RESUME", "RESUME_VM", "STEP_OVER", "STEP_INTO", "STEP_OUT", "STOP",
@@ -83,7 +84,7 @@ def only_session(explicit):
 def cmd_tools(_):
     print("\n".join([
         "bp-add", "bp-list", "bp-update", "bp-enable", "bp-disable", "bp-rm", "bp-clear", "attach", "attach-wait", "restoration-debug", "start", "sessions", "mute", "control", "snapshot", "threads", "thread-suspend", "thread-resume",
-        "step", "run-to", "frame", "detach", "set", "resume-with", "stack", "vars", "eval",
+        "step", "run-to", "frame", "detach", "set", "resume-with", "stack", "vars", "eval", "webhook", "watch",
     ]))
 
 
@@ -566,6 +567,169 @@ def cmd_eval(args):
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
+WEBHOOK_FILE = "webhook.json"
+EVENTS_FILE = "pause-events.jsonl"
+
+
+def parse_header(text):
+    name, sep, value = text.partition(":")
+    if not sep or not name.strip():
+        sys.exit(json.dumps({"error": "--header must look like 'Name: value'"}))
+    return name.strip(), value.strip()
+
+
+def webhook_patch(args):
+    """Turns webhook set flags into the patch the bridge merges. Only given flags are sent."""
+    patch = {}
+    if args.clear_url:
+        patch["url"] = ""
+    elif args.url is not None:
+        patch["url"] = args.url
+    if args.header is not None:
+        patch["headers"] = dict(parse_header(h) for h in args.header)
+    if args.header_env is not None:
+        pairs = {}
+        for item in args.header_env:
+            name, sep, env = item.partition("=")
+            if not sep or not name.strip() or not env.strip():
+                sys.exit(json.dumps({"error": "--header-env must look like Name=ENV_VAR"}))
+            pairs[name.strip()] = env.strip()
+        patch["headersFromEnv"] = pairs
+    if args.debounce is not None:
+        patch["debounceMs"] = args.debounce
+    if args.events_file is not None:
+        patch["eventsFile"] = args.events_file == "on"
+    if args.clear_command:
+        patch["onPauseCommand"] = []
+    elif args.command is not None:
+        patch["onPauseCommand"] = shlex.split(args.command)
+    if args.command_timeout is not None:
+        patch["commandTimeoutMs"] = args.command_timeout
+    if args.timeout is not None:
+        patch["timeoutMs"] = args.timeout
+    if args.enable is not None:
+        patch["enabled"] = args.enable
+    return patch
+
+
+def cmd_webhook(args):
+    if args.op == "show":
+        out = request("GET", "/v1/webhook", timeout=10)
+    elif args.op == "test":
+        out = request("POST", "/v1/webhook/test", {}, timeout=40)
+    elif args.op in ("enable", "disable"):
+        out = request("POST", "/v1/webhook", {"enabled": args.op == "enable"}, timeout=10)
+    else:
+        patch = webhook_patch(args)
+        if not patch:
+            sys.exit(json.dumps({"error": "webhook set needs at least one flag"}))
+        out = request("POST", "/v1/webhook", patch, timeout=10)
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+def pause_env(event):
+    env = dict(os.environ)
+    for key, name in (("event", "EVENT"), ("kind", "KIND"), ("file", "FILE"), ("line", "LINE"),
+                      ("thread", "THREAD"), ("sessionName", "SESSION"), ("timestamp", "TIMESTAMP")):
+        value = event.get(key)
+        env["ASDBG_" + name] = "" if value is None else str(value)
+    return env
+
+
+def run_exec(argv, event, timeout_ms):
+    """Runs argv (never a shell string) with the event json on stdin. Returns the exit code."""
+    try:
+        done = subprocess.run(argv, input=json.dumps(event, ensure_ascii=False).encode(),
+                              env=pause_env(event), timeout=timeout_ms / 1000)
+        return done.returncode
+    except subprocess.TimeoutExpired:
+        print(json.dumps({"warning": "exec timed out", "timeoutMs": timeout_ms}), file=sys.stderr)
+        return 124
+    except OSError as error:
+        print(json.dumps({"warning": "exec failed", "error": type(error).__name__}), file=sys.stderr)
+        return 127
+
+
+def watch_warnings():
+    config = HOME / WEBHOOK_FILE
+    try:
+        data = json.loads(config.read_text()) if config.exists() else {}
+    except (OSError, ValueError):
+        data = {}
+    if not data.get("enabled"):
+        print(f"warning: pause hooks are off. Run: asdbg.py webhook enable  ({config})", file=sys.stderr)
+    elif data.get("eventsFile") is False:
+        print("warning: eventsFile is off, so the events file is not written. Run: asdbg.py webhook set --events-file on", file=sys.stderr)
+
+
+def tail_events(path, deadline, poll=0.2):
+    """Yields new json lines appended to path after the call. Follows rotation to path.1."""
+    def stat():
+        try:
+            st = path.stat()
+            return st.st_ino, st.st_size
+        except FileNotFoundError:
+            return None, 0
+    inode, offset = stat()
+    buf = b""
+    while deadline is None or time.monotonic() < deadline:
+        cur_inode, size = stat()
+        if cur_inode is not None and (cur_inode != inode or size < offset):
+            inode, offset, buf = cur_inode, 0, b""
+        if cur_inode is not None and size > offset:
+            with open(path, "rb") as handle:
+                handle.seek(offset)
+                chunk = handle.read(size - offset)
+            offset += len(chunk)
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if line.strip():
+                    try:
+                        yield json.loads(line)
+                    except ValueError:
+                        continue
+            continue
+        time.sleep(poll)
+
+
+def bridge_pause_event(args, timeout_ms):
+    session = only_session(args.session)
+    out = control_call(session, {"action": "WAIT_FOR_PAUSE", "timeout": timeout_ms}, timeout=timeout_ms / 1000 + 10)
+    if out.get("event") != "paused":
+        return None
+    pos = out.get("position") or {}
+    return {"event": "paused", "kind": None, "source": "bridge-wait", "sessionId": session,
+            "file": pos.get("file"), "line": pos.get("line"), "thread": None,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+
+
+def cmd_watch(args):
+    if args.timeout:
+        check_timeout(args.timeout)
+    argv = shlex.split(args.exec) if args.exec else None
+    if args.exec and not argv:
+        sys.exit(json.dumps({"error": "--exec is empty"}))
+    deadline = None if not args.timeout else time.monotonic() + args.timeout / 1000
+    if args.bridge:
+        event = bridge_pause_event(args, args.timeout or 600000)
+        events = iter([event] if event else [])
+    else:
+        watch_warnings()
+        events = tail_events(HOME / EVENTS_FILE, deadline)
+    got = False
+    for event in events:
+        got = True
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+        if argv:
+            run_exec(argv, event, args.exec_timeout)
+        if args.once:
+            return
+    if not got:
+        print(json.dumps({"event": "timeout"}), flush=True)
+        sys.exit(2)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="asdbg")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -755,6 +919,30 @@ def build_parser():
     ev.add_argument("--session")
     ev.add_argument("--allow", action="store_true")
     ev.set_defaults(func=cmd_eval)
+    hook = sub.add_parser("webhook", help="pause hooks: http post, events file and command on pause. off by default")
+    hook.add_argument("op", choices=("show", "set", "enable", "disable", "test"))
+    hook.add_argument("--url", help="http or https url to POST the pause json to")
+    hook.add_argument("--clear-url", action="store_true")
+    hook.add_argument("--header", action="append", help="'Name: value'. repeat. replaces all literal headers")
+    hook.add_argument("--header-env", action="append", help="Name=ENV_VAR. value read from Android Studio's env. replaces all")
+    hook.add_argument("--debounce", type=int, help="ms. drop a repeat stop at the same place within this window")
+    hook.add_argument("--events-file", choices=("on", "off"))
+    hook.add_argument("--command", help="argv for onPauseCommand, split like a shell but never run by one")
+    hook.add_argument("--clear-command", action="store_true")
+    hook.add_argument("--command-timeout", type=int, help="ms")
+    hook.add_argument("--timeout", type=int, help="http timeout in ms (default 3000)")
+    hook.add_argument("--enable", dest="enable", action="store_true", default=None)
+    hook.add_argument("--disable", dest="enable", action="store_false")
+    hook.set_defaults(func=cmd_webhook)
+
+    watch = sub.add_parser("watch", help="wait for the next pause event, print its json, optionally run --exec")
+    watch.add_argument("--once", action="store_true", help="exit after the first event")
+    watch.add_argument("--timeout", type=int, default=0, help="ms. 0 waits forever. on timeout prints {\"event\":\"timeout\"} and exits 2")
+    watch.add_argument("--exec", help="command run per event with the json on stdin and ASDBG_* env. no shell")
+    watch.add_argument("--exec-timeout", type=int, default=60000, help="ms")
+    watch.add_argument("--bridge", action="store_true", help="use WAIT_FOR_PAUSE on the bridge instead of the events file")
+    watch.add_argument("--session")
+    watch.set_defaults(func=cmd_watch)
     return parser
 
 
@@ -818,6 +1006,20 @@ def self_check():
             raise
     else:
         raise SystemExit("eval without --allow should stop")
+    args = parser.parse_args(["webhook", "set", "--url", "http://127.0.0.1:9/hook", "--header", "Authorization: Bearer x",
+                              "--header-env", "X-Key=MY_KEY", "--debounce", "500", "--events-file", "off",
+                              "--command", "/usr/bin/say 'asdbg paused'", "--enable"])
+    patch = webhook_patch(args)
+    assert patch == {"url": "http://127.0.0.1:9/hook", "headers": {"Authorization": "Bearer x"},
+                     "headersFromEnv": {"X-Key": "MY_KEY"}, "debounceMs": 500, "eventsFile": False,
+                     "onPauseCommand": ["/usr/bin/say", "asdbg paused"], "enabled": True}, patch
+    assert webhook_patch(parser.parse_args(["webhook", "set", "--clear-url", "--clear-command"])) == {"url": "", "onPauseCommand": []}
+    assert webhook_patch(parser.parse_args(["webhook", "set", "--disable"])) == {"enabled": False}
+    assert parser.parse_args(["webhook", "show"]).op == "show"
+    args = parser.parse_args(["watch", "--once", "--timeout", "5000", "--exec", "echo hi"])
+    assert args.once and args.timeout == 5000 and shlex.split(args.exec) == ["echo", "hi"]
+    env = pause_env({"file": "a.kt", "line": 3, "thread": "main", "sessionName": None})
+    assert env["ASDBG_FILE"] == "a.kt" and env["ASDBG_LINE"] == "3" and env["ASDBG_SESSION"] == ""
     print("ok")
 
 

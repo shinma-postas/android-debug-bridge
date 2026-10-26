@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "dev.asdbg"
-version = "0.1.6"
+version = "0.1.7"
 
 repositories {
     mavenCentral()
@@ -24,7 +24,8 @@ dependencies {
 }
 
 tasks.test {
-    systemProperty("asdbg.exampleOut", System.getProperty("user.home") + "/Downloads/asdbg-snapshot-example.json")
+    systemProperty("asdbg.exampleOut", layout.buildDirectory.file("asdbg-snapshot-example.json").get().asFile.path)
+    systemProperty("asdbg.webhookExampleOut", layout.buildDirectory.file("asdbg-webhook-example.json").get().asFile.path)
 }
 
 kotlin {
@@ -37,7 +38,7 @@ intellijPlatform {
     pluginConfiguration {
         id = "dev.asdbg.bridge"
         name = "Android Debug Bridge"
-        version = "0.1.6"
+        version = "0.1.7"
         ideaVersion {
             sinceBuild = "262.9437"
             untilBuild = "262.*"

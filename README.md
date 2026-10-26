@@ -11,7 +11,7 @@ cd ide-plugin
 ./gradlew buildPlugin
 ```
 
-`ide-plugin/build/distributions/android-debug-bridge-0.1.6.zip` ができる。この zip を Android Studio の plugins に展開し、Android Studio を再起動する。起動後に `~/.android-debug-bridge/endpoint.json` と `token` ができる。
+`ide-plugin/build/distributions/android-debug-bridge-0.1.7.zip` ができる。この zip を Android Studio の plugins に展開し、Android Studio を再起動する。起動後に `~/.android-debug-bridge/endpoint.json` と `token` ができる。
 
 ## CLI
 
@@ -218,6 +218,89 @@ asdbg resume-with --json '[{"path":"a.code","value":{"int":"200"}},{"path":"a.pa
 
 `eval` は対象プロセスで式を実行する。`--allow` が無いと送らない。削除できるブレークポイントは、このブリッジが作ったものだけ。
 
+### 止まったことを知らせる（pause hooks、0.1.7）
+
+デバッガが止まるたびに、止まった場所を外へ知らせる。ブレークポイント、ステップの終わり、例外・メソッド・フィールドのブレークポイント、手動の Pause のどれでも動く。`suspend=thread` の停止も拾う。初期状態では止めてある。
+
+知らせ方は 3 つあり、どれも同じ JSON を使う。
+
+1. イベントファイル: `~/.android-debug-bridge/pause-events.jsonl` に 1 行ずつ足す。1 MB（`eventsMaxBytes`）を超えると `pause-events.jsonl.1` へ回す。権限は 600。
+2. HTTP POST: `url` に JSON を POST する。別スレッドで送り、タイムアウトは 3 秒（`timeoutMs`）。失敗はログに残すだけで再送しない。リダイレクトは追わない。
+3. コマンド: `onPauseCommand` に書いた argv を実行する。標準入力に JSON、環境変数に `ASDBG_EVENT`、`ASDBG_KIND`、`ASDBG_FILE`、`ASDBG_LINE`、`ASDBG_THREAD`、`ASDBG_SESSION`、`ASDBG_TIMESTAMP` を入れる。シェルは通さない。`commandTimeoutMs`（初期 10 秒）を過ぎたら止める。出力は `~/.android-debug-bridge/on-pause.log` に出る。
+
+JSON の例:
+
+```
+{"event":"paused","kind":"breakpoint","source":"jdi","sessionId":"a1b2c3","sessionName":"app","project":"selfregi-for-android","file":"app/src/main/java/com/example/MainActivity.kt","line":42,"class":"com.example.MainActivity","method":"onCreate","thread":"main","threadLevel":true,"policy":"thread","breakpointId":"5f0c...","timestamp":"2026-10-26T16:40:00.123+09:00","pluginVersion":"0.1.7","seq":1}
+```
+
+- `kind` は `breakpoint`、`step`、`exception`、`method`、`field`、`pause`、`run_to_line`、`other` のどれか。
+- `source` は `jdi`（Java のデバッガから直接）か `session`（それ以外の停止。手動 Pause など）。同じ停止は 1 回だけ送る。
+- `line` は 1 始まり。`file` はプロジェクトからの相対パス。
+- `threadLevel` は `suspend=thread` の停止なら `true`。
+- 変数の値、eval の結果、ログの本文、ブリッジの token は入れない。
+
+設定ファイル `~/.android-debug-bridge/webhook.json`（権限 600）:
+
+```
+{
+  "enabled": true,
+  "url": "http://127.0.0.1:8787/asdbg",
+  "headers": {},
+  "headersFromEnv": {"Authorization": "ASDBG_HOOK_AUTH"},
+  "debounceMs": 0,
+  "eventsFile": true,
+  "eventsMaxBytes": 1000000,
+  "onPauseCommand": ["/usr/bin/say", "止まりました"],
+  "commandTimeoutMs": 10000,
+  "timeoutMs": 3000
+}
+```
+
+- `enabled` が `false` なら何もしない。止まるたびの負荷もない。
+- `url` は http か https だけ。空にすると POST しない。
+- `headersFromEnv` はヘッダの値を Android Studio の環境変数から読む。Dock から起動した Android Studio にはシェルの環境変数が入らないことがある。
+- `debounceMs` を入れると、同じセッション・スレッド・場所の停止がその時間内に続いたとき 2 回目以降を送らない。
+- ヘッダの値と URL のパスは `webhook show` で `***` になる。ログにも出さない。
+- 設定はブリッジ経由で変えると即時に効く。ファイルを手で直したときは Android Studio の再起動で読み直す。
+
+CLI:
+
+```
+asdbg webhook show
+asdbg webhook enable
+asdbg webhook disable
+asdbg webhook set --url http://127.0.0.1:8787/asdbg --header-env Authorization=ASDBG_HOOK_AUTH
+asdbg webhook set --command "/usr/bin/say 止まりました" --command-timeout 5000
+asdbg webhook set --events-file off --debounce 500
+asdbg webhook set --clear-url --clear-command
+asdbg webhook test
+```
+
+- `--header 'Name: value'` と `--header-env Name=ENV` は、渡したもので全部を置き換える。
+- `--command` はシェルの書き方で分けて argv にするだけで、シェルでは実行しない。
+- `webhook test` は止めていなくても、設定した全部の経路へ見本の JSON を送る（`enabled` が `false` でも送る）。
+
+次の停止を待つ（`watch`）:
+
+```
+# 次に止まったら JSON を 1 行出して終わる
+asdbg watch --once --timeout 600000
+
+# 止まるたびにコマンドを実行する（標準入力に JSON、ASDBG_* の環境変数つき）
+asdbg watch --exec "python3 next_step.py"
+
+# イベントファイルを使わず、ブリッジの WAIT_FOR_PAUSE で待つ
+asdbg watch --once --bridge --timeout 60000
+```
+
+- `watch` は `pause-events.jsonl` の今の末尾から読む。ファイルが回っても追う。
+- 時間内に何も来なければ `{"event": "timeout"}` を出して終了コード 2 で終わる。
+- hooks が止まっている、または `eventsFile` が `off` のときは警告を出す。
+- `ASDBG_HOME` を指定すると、CLI と MCP はそのディレクトリを `~/.android-debug-bridge` の代わりに読む（試験用）。
+
+エージェントから使うときは、`watch --once` か MCP の `wait_pause_event` で待ち、返ってきた `file` と `line` を見て次の操作（`snapshot`、`set` など）をする。
+
 ## MCP
 
 Cursor の MCP 設定に次を足す。
@@ -226,7 +309,10 @@ Cursor の MCP 設定に次を足す。
 python3 /Users/shinma.takahashi/Develop/selfregi/android-debug-bridge/mcp-adapter/server.py
 ```
 
-ツール: `bp_add`、`bp_list`、`bp_update`、`bp_remove`、`bp_clear`、`attach`、`start`、`sessions`、`mute`、`control`、`threads`、`snapshot`、`stack`、`variables`、`evaluate`、`set_value`。
+ツール: `bp_add`、`bp_list`、`bp_update`、`bp_remove`、`bp_clear`、`attach`、`start`、`sessions`、`mute`、`control`、`threads`、`snapshot`、`stack`、`variables`、`evaluate`、`set_value`、`webhook_get`、`webhook_set`、`webhook_test`、`wait_pause_event`。
+
+- `webhook_get`、`webhook_set`、`webhook_test` は CLI の `webhook show`、`set`、`test` と同じ。`webhook_set` は `webhook.json` と同じキーを取る。
+- `wait_pause_event` は `pause-events.jsonl` に次の行が来るまで待って返す。`timeout` はミリ秒（初期 60000）。
 
 - `control` の action は CLI と同じ。`SUSPEND_THREAD`、`RESUME_THREAD`、`STEP_*` は `thread`、`RUN_TO_LINE` は `file` と `line`、`SELECT_FRAME` は `frameIndex` と `thread` を取る。`DETACH` も使える。
 - `attach` は `waitReady: true` で準備を待つ。

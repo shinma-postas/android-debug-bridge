@@ -4,11 +4,12 @@
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-HOME = Path.home() / ".android-debug-bridge"
+HOME = Path(os.environ["ASDBG_HOME"]) if os.environ.get("ASDBG_HOME") else Path.home() / ".android-debug-bridge"
 ENDPOINT = HOME / "endpoint.json"
 
 SNAPSHOT_PROPS = {
@@ -222,6 +223,58 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "webhook_get",
+        "description": (
+            "Show the pause hooks config (webhook.json), file paths and counters. Pause hooks fire on every stop "
+            "(breakpoint, step end, exception/method/field breakpoint, manual pause) with location only: "
+            "file, line, class, method, thread, kind, session, breakpoint id, timestamp. Never values. "
+            "Header values and the url path are masked."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "webhook_set",
+        "description": (
+            "Change pause hooks. Only given keys change. enabled turns everything on or off (default off). "
+            "url: http(s) to POST the pause json to (\"\" clears). headers: literal headers, replaces all. "
+            "headersFromEnv: {header: ENV_VAR} read from Android Studio's environment. "
+            "eventsFile: append each pause to ~/.android-debug-bridge/pause-events.jsonl (default true). "
+            "onPauseCommand: argv array run per pause with the json on stdin and ASDBG_* env, no shell. "
+            "debounceMs, commandTimeoutMs, timeoutMs (http, default 3000)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "url": {"type": "string"},
+                "headers": {"type": "object"},
+                "headersFromEnv": {"type": "object"},
+                "debounceMs": {"type": "integer"},
+                "eventsFile": {"type": "boolean"},
+                "eventsMaxBytes": {"type": "integer"},
+                "onPauseCommand": {"type": "array", "items": {"type": "string"}},
+                "commandTimeoutMs": {"type": "integer"},
+                "timeoutMs": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "name": "webhook_test",
+        "description": "Send a sample pause event through every configured channel (url, events file, command), even when disabled. Returns per-channel results.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "wait_pause_event",
+        "description": (
+            "Wait for the next line in pause-events.jsonl and return it. Needs pause hooks enabled with eventsFile on. "
+            "Works for every session and project, including suspend=thread stops. Returns {event: timeout} when nothing comes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"timeout": {"type": "integer", "description": "milliseconds. default 60000, max 600000"}},
+        },
+    },
 ]
 
 
@@ -288,6 +341,40 @@ def session_id(args):
 
 def snapshot_body(args):
     return {key: args[key] for key in SNAPSHOT_KEYS if args.get(key) is not None}
+
+
+def wait_pause_event(timeout_ms):
+    path = HOME / "pause-events.jsonl"
+    def stat():
+        try:
+            st = path.stat()
+            return st.st_ino, st.st_size
+        except FileNotFoundError:
+            return None, 0
+    inode, offset = stat()
+    buf = b""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        cur, size = stat()
+        if cur is not None and (cur != inode or size < offset):
+            inode, offset, buf = cur, 0, b""
+        if cur is not None and size > offset:
+            with open(path, "rb") as handle:
+                handle.seek(offset)
+                chunk = handle.read(size - offset)
+            offset += len(chunk)
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if line.strip():
+                    try:
+                        json.loads(line)
+                        return line.decode(), False
+                    except ValueError:
+                        continue
+            continue
+        time.sleep(0.2)
+    return json.dumps({"event": "timeout", "timeoutMs": timeout_ms}), False
 
 
 def call_tool(name, args):
@@ -402,6 +489,19 @@ def call_tool(name, args):
         if args.get("resume"):
             body["resume"] = True
         return bridge("POST", f"/v1/sessions/{session_id(args)}/control", body, project, timeout=30)
+    if name == "webhook_get":
+        return bridge("GET", "/v1/webhook", project=project, timeout=10)
+    if name == "webhook_set":
+        keys = ("enabled", "url", "headers", "headersFromEnv", "debounceMs", "eventsFile", "eventsMaxBytes",
+                "onPauseCommand", "commandTimeoutMs", "timeoutMs")
+        body = {key: args[key] for key in keys if key in args}
+        if not body:
+            return json.dumps({"error": "pass at least one setting"}), True
+        return bridge("POST", "/v1/webhook", body, project, timeout=10)
+    if name == "webhook_test":
+        return bridge("POST", "/v1/webhook/test", {}, project, timeout=40)
+    if name == "wait_pause_event":
+        return wait_pause_event(min(max(int(args.get("timeout") or 60000), 100), 600000))
     return json.dumps({"error": f"unknown tool {name}"}), True
 
 
@@ -418,7 +518,7 @@ def handle(message):
             "result": {
                 "protocolVersion": requested,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "android-studio-debug", "version": "0.1.6"},
+                "serverInfo": {"name": "android-studio-debug", "version": "0.1.7"},
             },
         }
     if method == "tools/list":
@@ -444,9 +544,10 @@ def self_check():
     parsed = json.loads(line)
     assert parsed["method"] == "tools/list"
     names = [tool["name"] for tool in TOOLS]
-    for tool in ("snapshot", "mute", "threads", "bp_update", "set_value"):
+    for tool in ("snapshot", "mute", "threads", "bp_update", "set_value", "webhook_get", "webhook_set", "webhook_test", "wait_pause_event"):
         assert tool in names, tool
     assert snapshot_body({"depth": 3, "sessionId": "x", "toString": None}) == {"depth": 3}
+    assert json.loads(call_tool("webhook_set", {})[0])["error"]
     print("ok")
 
 
