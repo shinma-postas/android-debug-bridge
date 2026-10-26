@@ -13,7 +13,11 @@ from pathlib import Path
 
 HOME = Path.home() / ".android-debug-bridge"
 ENDPOINT = HOME / "endpoint.json"
-ACTIONS = ("PAUSE", "RESUME", "RESUME_VM", "STEP_OVER", "STEP_INTO", "STEP_OUT", "STOP", "WAIT_FOR_PAUSE", "SNAPSHOT", "MUTE", "UNMUTE")
+ACTIONS = (
+    "PAUSE", "RESUME", "RESUME_VM", "STEP_OVER", "STEP_INTO", "STEP_OUT", "STOP",
+    "WAIT_FOR_PAUSE", "SNAPSHOT", "MUTE", "UNMUTE",
+    "SUSPEND_THREAD", "RESUME_THREAD", "RUN_TO_LINE", "SELECT_FRAME", "DETACH",
+)
 
 
 def endpoint():
@@ -77,7 +81,8 @@ def only_session(explicit):
 
 def cmd_tools(_):
     print("\n".join([
-        "bp-add", "bp-list", "bp-rm", "bp-clear", "attach", "attach-wait", "restoration-debug", "start", "sessions", "mute", "control", "snapshot", "stack", "vars", "eval",
+        "bp-add", "bp-list", "bp-update", "bp-enable", "bp-disable", "bp-rm", "bp-clear", "attach", "attach-wait", "restoration-debug", "start", "sessions", "mute", "control", "snapshot", "threads", "thread-suspend", "thread-resume",
+        "step", "run-to", "frame", "detach", "stack", "vars", "eval",
     ]))
 
 
@@ -112,6 +117,31 @@ def cmd_bp_add(args):
 
 def cmd_bp_list(_):
     print(json.dumps(request("GET", "/v1/breakpoints"), indent=2))
+
+
+def cmd_bp_update(args):
+    body = {}
+    if args.enable is not None:
+        body["enabled"] = args.enable
+    if args.condition is not None:
+        body["condition"] = args.condition
+    if args.log_message is not None:
+        body["logMessage"] = args.log_message == "on"
+    if args.log_expression is not None:
+        body["logExpression"] = args.log_expression
+    if args.log_stack is not None:
+        body["logStack"] = args.log_stack == "on"
+    if args.suspend:
+        body["suspend"] = args.suspend
+    if args.pass_count is not None:
+        body["passCount"] = args.pass_count
+    if not body:
+        sys.exit("nothing to change")
+    print(json.dumps(request("POST", f"/v1/breakpoints/{args.id}", body), indent=2))
+
+
+def cmd_bp_toggle(args):
+    print(json.dumps(request("POST", f"/v1/breakpoints/{args.id}", {"enabled": args.enabled}), indent=2))
 
 
 def cmd_bp_rm(args):
@@ -352,10 +382,60 @@ def add_snapshot_args(cmd):
     )
 
 
+def control_call(session, body, timeout=30):
+    return request("POST", f"/v1/sessions/{session}/control", body, timeout=timeout)
+
+
+def cmd_threads(args):
+    session = only_session(args.session)
+    print(json.dumps(request("GET", f"/v1/sessions/{session}/threads?frames={args.frames}"), indent=2, ensure_ascii=False))
+
+
+def cmd_thread_suspend(args):
+    session = only_session(args.session)
+    print(json.dumps(control_call(session, {"action": "SUSPEND_THREAD", "thread": args.thread}), indent=2))
+
+
+def cmd_thread_resume(args):
+    session = only_session(args.session)
+    print(json.dumps(control_call(session, {"action": "RESUME_THREAD", "thread": args.thread}), indent=2))
+
+
+def cmd_step(args):
+    session = only_session(args.session)
+    body = {"action": "STEP_" + args.kind.upper()}
+    if args.thread:
+        body["thread"] = args.thread
+    print(json.dumps(control_call(session, body), indent=2))
+
+
+def cmd_run_to(args):
+    session = only_session(args.session)
+    body = {"action": "RUN_TO_LINE", "file": args.file, "line": args.line, "ignoreBreakpoints": args.ignore_breakpoints}
+    if args.thread:
+        body["thread"] = args.thread
+    print(json.dumps(control_call(session, body), indent=2))
+
+
+def cmd_frame(args):
+    session = only_session(args.session)
+    body = {"action": "SELECT_FRAME", "frameIndex": args.index}
+    if args.thread:
+        body["thread"] = args.thread
+    print(json.dumps(control_call(session, body), indent=2))
+
+
+def cmd_detach(args):
+    session = only_session(args.session)
+    print(json.dumps(control_call(session, {"action": "DETACH"}), indent=2))
+
+
 def cmd_control(args):
     check_timeout(args.timeout)
     session = only_session(args.session)
     body = {"action": args.action, "timeout": args.timeout}
+    if args.thread_name:
+        body["thread"] = args.thread_name
     wants = args.snapshot or args.action == "SNAPSHOT"
     if wants:
         body.update(snapshot_body(args))
@@ -404,9 +484,12 @@ def cmd_eval(args):
     if not args.allow:
         sys.exit("eval runs code in the process. Pass --allow.")
     session = only_session(args.session)
-    print(json.dumps(request("POST", f"/v1/sessions/{session}/evaluate", {
+    result = request("POST", f"/v1/sessions/{session}/evaluate", {
         "expression": args.expression,
-    }, allow_eval=True), indent=2))
+    }, allow_eval=True)
+    if result.get("warning"):
+        print("warning: " + result["warning"], file=sys.stderr)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 def build_parser():
@@ -430,6 +513,22 @@ def build_parser():
 
     sub.add_parser("bp-list").set_defaults(func=cmd_bp_list)
     sub.add_parser("bp-clear").set_defaults(func=cmd_bp_clear)
+    upd = sub.add_parser("bp-update", help="change an existing breakpoint. id from bp-list")
+    upd.add_argument("id")
+    upd.add_argument("--enable", dest="enable", action="store_true", default=None)
+    upd.add_argument("--disable", dest="enable", action="store_false")
+    upd.add_argument("--condition", help="empty string clears it")
+    upd.add_argument("--log-message", choices=["on", "off"], help="log 'Breakpoint hit' message")
+    upd.add_argument("--log-expression", help="evaluate and log. empty string clears it")
+    upd.add_argument("--log-stack", choices=["on", "off"])
+    upd.add_argument("--suspend", choices=["all", "thread", "none"], help="none logs without stopping")
+    upd.add_argument("--pass-count", type=int, help="stop on the Nth hit. 0 turns it off")
+    upd.set_defaults(func=cmd_bp_update)
+    for name, enabled in (("bp-enable", True), ("bp-disable", False)):
+        toggle = sub.add_parser(name)
+        toggle.add_argument("id")
+        toggle.set_defaults(func=cmd_bp_toggle, enabled=enabled)
+
     rm = sub.add_parser("bp-rm")
     rm.add_argument("id")
     rm.set_defaults(func=cmd_bp_rm)
@@ -502,6 +601,7 @@ def build_parser():
     control.add_argument("action", choices=ACTIONS)
     control.add_argument("--session")
     control.add_argument("--timeout", type=int, default=60000, help="milliseconds")
+    control.add_argument("--thread-name", help="STEP_*, SUSPEND_THREAD, RESUME_THREAD, RUN_TO_LINE, SELECT_FRAME: thread name")
     control.add_argument("--snapshot", action="store_true", help="WAIT_FOR_PAUSE: add a snapshot when it stops")
     add_snapshot_args(control)
     control.set_defaults(func=cmd_control)
@@ -510,6 +610,41 @@ def build_parser():
     snap.add_argument("--session")
     add_snapshot_args(snap)
     snap.set_defaults(func=cmd_snapshot)
+
+    threads = sub.add_parser("threads", help="every thread with status. --frames N adds top frames of suspended threads")
+    threads.add_argument("--session")
+    threads.add_argument("--frames", type=int, default=0)
+    threads.set_defaults(func=cmd_threads)
+
+    for name, func in (("thread-suspend", cmd_thread_suspend), ("thread-resume", cmd_thread_resume)):
+        cmd = sub.add_parser(name)
+        cmd.add_argument("thread")
+        cmd.add_argument("--session")
+        cmd.set_defaults(func=func)
+
+    step = sub.add_parser("step", help="step over, into, or out. --thread picks a suspended thread")
+    step.add_argument("kind", choices=["over", "into", "out"])
+    step.add_argument("--thread")
+    step.add_argument("--session")
+    step.set_defaults(func=cmd_step)
+
+    run_to = sub.add_parser("run-to", help="run to a line, like Run to Cursor")
+    run_to.add_argument("file")
+    run_to.add_argument("line", type=int)
+    run_to.add_argument("--thread")
+    run_to.add_argument("--ignore-breakpoints", action="store_true")
+    run_to.add_argument("--session")
+    run_to.set_defaults(func=cmd_run_to)
+
+    frame = sub.add_parser("frame", help="select a frame (and thread). stack, vars and eval then use it")
+    frame.add_argument("index", type=int)
+    frame.add_argument("--thread")
+    frame.add_argument("--session")
+    frame.set_defaults(func=cmd_frame)
+
+    detach = sub.add_parser("detach", help="detach the debugger and leave the app running")
+    detach.add_argument("--session")
+    detach.set_defaults(func=cmd_detach)
 
     for name, func in (("stack", cmd_stack), ("vars", cmd_vars)):
         cmd = sub.add_parser(name)
@@ -548,6 +683,16 @@ def self_check():
     assert check_timeout(30000, strict=True) == 30000
     assert parser.parse_args(["attach", "--serial", "X", "--wait-ready"]).wait_ready
     assert parser.parse_args(["mute", "off"]).state == "off"
+    args = parser.parse_args(["bp-update", "abc", "--disable", "--pass-count", "3", "--suspend", "none"])
+    assert args.enable is False and args.pass_count == 3 and args.suspend == "none"
+    assert parser.parse_args(["bp-update", "abc"]).enable is None
+    assert parser.parse_args(["bp-enable", "abc"]).enabled is True
+    assert parser.parse_args(["step", "over", "--thread", "main"]).thread == "main"
+    args = parser.parse_args(["run-to", "app/Main.kt", "10", "--ignore-breakpoints"])
+    assert args.line == 10 and args.ignore_breakpoints
+    assert parser.parse_args(["frame", "2"]).index == 2
+    assert parser.parse_args(["threads", "--frames", "5"]).frames == 5
+    assert parser.parse_args(["control", "STEP_OVER", "--thread-name", "main"]).thread_name == "main"
     try:
         cmd_eval(parser.parse_args(["eval", "1+1"]))
     except SystemExit as error:

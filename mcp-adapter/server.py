@@ -47,6 +47,33 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {"projectPath": {"type": "string"}}},
     },
     {
+        "name": "bp_update",
+        "description": "Change an existing breakpoint, including ones set by hand: enabled, condition (empty clears), logMessage, logExpression (empty clears), logStack, suspend (all, thread, none), passCount (stop on the Nth hit, 0 turns it off). Only given fields change.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "enabled": {"type": "boolean"},
+                "condition": {"type": "string"},
+                "logMessage": {"type": "boolean"},
+                "logExpression": {"type": "string"},
+                "logStack": {"type": "boolean"},
+                "suspend": {"type": "string", "enum": ["all", "thread", "none"]},
+                "passCount": {"type": "integer"},
+                "projectPath": {"type": "string"},
+            },
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "threads",
+        "description": "Every thread in the debugged VM with status, suspended, suspendCount and stoppedHere. frames > 0 adds that many top frames for suspended threads.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"sessionId": {"type": "string"}, "frames": {"type": "integer"}, "projectPath": {"type": "string"}},
+        },
+    },
+    {
         "name": "bp_remove",
         "description": "Remove a breakpoint created by this bridge.",
         "inputSchema": {
@@ -97,7 +124,7 @@ TOOLS = [
     },
     {
         "name": "control",
-        "description": "PAUSE, RESUME, RESUME_VM, STEP_OVER, STEP_INTO, STEP_OUT, STOP, WAIT_FOR_PAUSE, or SNAPSHOT. RESUME also resumes suspend=thread stops. RESUME_VM resumes the whole VM as a last resort. WAIT_FOR_PAUSE with snapshot=true adds the snapshot tool's result when it stops.",
+        "description": "PAUSE, RESUME, RESUME_VM, STEP_OVER, STEP_INTO, STEP_OUT, STOP, DETACH, WAIT_FOR_PAUSE, SNAPSHOT, SUSPEND_THREAD, RESUME_THREAD, RUN_TO_LINE, or SELECT_FRAME. RESUME also resumes suspend=thread stops. RESUME_VM resumes the whole VM as a last resort. DETACH leaves the app running. STEP_* take an optional thread. SUSPEND_THREAD and RESUME_THREAD need thread. RUN_TO_LINE needs file and line (1-based). SELECT_FRAME takes frameIndex and an optional thread; stack, variables and evaluate then use that frame. WAIT_FOR_PAUSE with snapshot=true adds the snapshot tool's result when it stops.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -105,6 +132,9 @@ TOOLS = [
                 "sessionId": {"type": "string"},
                 "timeout": {"type": "integer", "description": "milliseconds"},
                 "snapshot": {"type": "boolean"},
+                "file": {"type": "string", "description": "RUN_TO_LINE"},
+                "line": {"type": "integer", "description": "RUN_TO_LINE, 1-based"},
+                "ignoreBreakpoints": {"type": "boolean", "description": "RUN_TO_LINE"},
                 **SNAPSHOT_PROPS,
                 "projectPath": {"type": "string"},
             },
@@ -242,6 +272,15 @@ def call_tool(name, args):
         return bridge("POST", "/v1/breakpoints", body, project)
     if name == "bp_list":
         return bridge("GET", "/v1/breakpoints", project=project)
+    if name == "bp_update":
+        keys = ("enabled", "condition", "logMessage", "logExpression", "logStack", "suspend", "passCount")
+        body = {key: args[key] for key in keys if key in args}
+        if not body:
+            return json.dumps({"error": "nothing to change"}), True
+        return bridge("POST", "/v1/breakpoints/" + args["id"], body, project)
+    if name == "threads":
+        frames = int(args.get("frames") or 0)
+        return bridge("GET", f"/v1/sessions/{session_id(args)}/threads?frames={frames}", project=project)
     if name == "bp_remove":
         return bridge("DELETE", "/v1/breakpoints/" + args["id"], project=project)
     if name == "bp_clear":
@@ -273,6 +312,9 @@ def call_tool(name, args):
         timeout = int(args.get("timeout") or 60000)
         body = {"action": args["action"], "timeout": timeout}
         body.update(snapshot_body(args))
+        for key in ("file", "line", "ignoreBreakpoints"):
+            if args.get(key) is not None:
+                body[key] = args[key]
         if args.get("snapshot"):
             body["snapshot"] = True
         extra = int(args.get("snapshotTimeout") or 10000) / 1000
@@ -351,7 +393,9 @@ def self_check():
     line = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"
     parsed = json.loads(line)
     assert parsed["method"] == "tools/list"
-    assert "snapshot" in [tool["name"] for tool in TOOLS]
+    names = [tool["name"] for tool in TOOLS]
+    for tool in ("snapshot", "mute", "threads", "bp_update"):
+        assert tool in names, tool
     assert snapshot_body({"depth": 3, "sessionId": "x", "toString": None}) == {"depth": 3}
     print("ok")
 

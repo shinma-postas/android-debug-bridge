@@ -225,6 +225,8 @@ private object BridgeServer {
             method == "POST" && path == "/v1/breakpoints" -> send(exchange, 200, addBreakpoint(project, body(exchange)))
             method == "GET" && path == "/v1/breakpoints" -> send(exchange, 200, mapOf("breakpoints" to listBreakpoints(project)))
             method == "DELETE" && path == "/v1/breakpoints" -> send(exchange, 200, clearAllBreakpoints(project))
+            method == "POST" && path.startsWith("/v1/breakpoints/") ->
+                send(exchange, 200, updateBreakpoint(project, path.removePrefix("/v1/breakpoints/"), body(exchange)))
             method == "DELETE" && path.startsWith("/v1/breakpoints/") -> {
                 removeBreakpoint(project, path.removePrefix("/v1/breakpoints/"))
                 send(exchange, 200, mapOf("removed" to true))
@@ -240,6 +242,19 @@ private object BridgeServer {
             method == "GET" && path.matches(Regex("/v1/sessions/[^/]+/stack")) -> {
                 val id = path.removePrefix("/v1/sessions/").removeSuffix("/stack")
                 send(exchange, 200, mapOf("frames" to stack(project, id)))
+            }
+            method == "GET" && path.matches(Regex("/v1/sessions/[^/]+/threads")) -> {
+                val id = path.removePrefix("/v1/sessions/").removeSuffix("/threads")
+                val frames = (query(exchange, "frames")?.toIntOrNull() ?: 0).coerceIn(0, 200)
+                val session = requireSession(project, id)
+                val threads = JavaDebug.threads(session, frames) ?: throw ApiException(409, "not a Java debug session")
+                threads.forEach { thread ->
+                    @Suppress("UNCHECKED_CAST")
+                    (thread["frames"] as? List<MutableMap<String, Any?>>)?.forEach { frame ->
+                        frame["file"] = (frame["sourcePath"] as? String)?.let { resolveSource(project, it) }
+                    }
+                }
+                send(exchange, 200, mapOf("sessionId" to id, "threads" to threads))
             }
             method == "GET" && path.matches(Regex("/v1/sessions/[^/]+/variables")) -> {
                 val id = path.removePrefix("/v1/sessions/").removeSuffix("/variables")
@@ -642,19 +657,38 @@ private object BridgeServer {
                     if (!JavaDebug.resumeVm(session)) throw ApiException(409, "not a Java debug session")
                     extra["vmResumed"] = true
                 }
-                "STEP_OVER" -> {
-                    if (!session.isSuspended) throw ApiException(409, "session is running")
-                    edt { session.stepOver(false) }
+                "STEP_OVER", "STEP_INTO", "STEP_OUT" -> {
+                    val thread = json.str("thread")
+                    if (thread == null && session.isSuspended) {
+                        edt {
+                            when (action) {
+                                "STEP_OVER" -> session.stepOver(false)
+                                "STEP_INTO" -> session.stepInto()
+                                else -> session.stepOut()
+                            }
+                        }
+                    } else {
+                        // A named thread, or a suspend=thread stop the session does not report as suspended.
+                        extra["thread"] = JavaDebug.step(session, action, thread)
+                            ?: throw ApiException(409, "not a Java debug session")
+                    }
                 }
-                "STEP_INTO" -> {
-                    if (!session.isSuspended) throw ApiException(409, "session is running")
-                    edt { session.stepInto() }
+                "SUSPEND_THREAD" -> {
+                    val thread = json.str("thread") ?: throw ApiException(400, "thread is required")
+                    extra["thread"] = JavaDebug.freezeThread(session, thread) ?: throw ApiException(409, "not a Java debug session")
                 }
-                "STEP_OUT" -> {
-                    if (!session.isSuspended) throw ApiException(409, "session is running")
-                    edt { session.stepOut() }
+                "RESUME_THREAD" -> {
+                    val thread = json.str("thread") ?: throw ApiException(400, "thread is required")
+                    extra["thread"] = JavaDebug.resumeThread(session, thread) ?: throw ApiException(409, "not a Java debug session")
                 }
+                "RUN_TO_LINE" -> extra["target"] = runToLine(session, json)
+                "SELECT_FRAME" -> extra["frame"] = selectFrame(session, json)
                 "STOP" -> edt { session.stop() }
+                "DETACH" -> {
+                    val handler = session.debugProcess.processHandler
+                    edt { handler.detachProcess() }
+                    extra["detached"] = true
+                }
                 "MUTE", "UNMUTE" -> {
                     edt { session.setBreakpointMuted(action == "MUTE") }
                     extra["muted"] = safe { session.areBreakpointsMuted() }
@@ -785,10 +819,94 @@ private object BridgeServer {
         }
     }
 
+    private fun runToLine(session: XDebugSession, json: JsonObject): Map<String, Any?> {
+        val project = session.project
+        val rel = json.str("file") ?: throw ApiException(400, "file is required")
+        val line = json.int("line") ?: throw ApiException(400, "line is required")
+        if (line < 1) throw ApiException(400, "line starts at 1")
+        val abs = if (File(rel).isAbsolute) rel else File(project.basePath, rel).path
+        val file = LocalFileSystem.getInstance().refreshAndFindFileByPath(abs)
+            ?: throw ApiException(404, "file not found: $abs")
+        val position = com.intellij.xdebugger.XDebuggerUtil.getInstance().createPosition(file, line - 1)
+            ?: throw ApiException(400, "no position at $abs:$line")
+        val ignore = json.bool("ignoreBreakpoints")
+        if (session.isSuspended && json.str("thread") == null) {
+            edt { session.runToPosition(position, ignore) }
+        } else {
+            JavaDebug.runToLine(session, position, ignore, json.str("thread"))
+                ?: throw ApiException(409, "not a Java debug session")
+        }
+        return mapOf("file" to relative(project, file.url), "line" to line, "ignoreBreakpoints" to ignore)
+    }
+
+    /** Same as clicking a frame (and a thread) in the Frames panel. vars, stack and eval then use it. */
+    private fun selectFrame(session: XDebugSession, json: JsonObject): Map<String, Any?> {
+        if (safe { session.isSuspended } != true) throw ApiException(409, "session is running")
+        val context = session.suspendContext ?: throw ApiException(409, "no suspend context")
+        val index = json.int("frameIndex") ?: 0
+        val wanted = json.str("thread")
+        val stack = if (wanted == null) {
+            currentStack(session) ?: context.activeExecutionStack
+        } else {
+            executionStacks(context).firstOrNull { it.displayName == wanted || it.displayName.startsWith("\"$wanted\"") }
+                ?: throw ApiException(404, "thread not found: $wanted")
+        } ?: throw ApiException(409, "no execution stack")
+        val frames = readFrames(stack)
+        val frame = frames.getOrNull(index) ?: throw ApiException(404, "frame $index not found. frames=${frames.size}")
+        edt { session.setCurrentStackFrame(stack, frame, index == 0) }
+        return frameDto(session.project, index, frame) + mapOf("thread" to stack.displayName)
+    }
+
+    private fun currentStack(session: XDebugSession): XExecutionStack? = safe {
+        session.javaClass.methods.firstOrNull { it.name == "getCurrentExecutionStack" && it.parameterCount == 0 }
+            ?.invoke(session) as? XExecutionStack
+    }
+
+    private fun executionStacks(context: com.intellij.xdebugger.frame.XSuspendContext): List<XExecutionStack> {
+        val future = CompletableFuture<List<XExecutionStack>>()
+        val acc = mutableListOf<XExecutionStack>()
+        context.computeExecutionStacks(object : com.intellij.xdebugger.frame.XSuspendContext.XExecutionStackContainer {
+            override fun addExecutionStack(stacks: MutableList<out XExecutionStack>, last: Boolean) {
+                acc += stacks
+                if (last && !future.isDone) future.complete(acc.toList())
+            }
+
+            override fun errorOccurred(errorMessage: String) {
+                if (!future.isDone) future.complete(acc.toList())
+            }
+
+            override fun isObsolete(): Boolean = false
+        })
+        return future.get(5, TimeUnit.SECONDS)
+    }
+
+    private fun updateBreakpoint(project: Project, rawId: String, json: JsonObject): Map<String, Any?> = edtWrite {
+        val id = URLDecoder.decode(rawId, StandardCharsets.UTF_8)
+        val bp = XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints
+            .firstOrNull { breakpointId(it) == id }
+            ?: throw ApiException(404, "breakpoint not found")
+        if (json.has("enabled")) bp.isEnabled = json.bool("enabled")
+        if (json.has("condition")) bp.setCondition(json.str("condition")?.takeIf { it.isNotBlank() })
+        if (json.has("logMessage")) bp.isLogMessage = json.bool("logMessage")
+        if (json.has("logStack")) bp.isLogStack = json.bool("logStack")
+        if (json.has("logExpression")) bp.setLogExpression(json.str("logExpression")?.takeIf { it.isNotBlank() })
+        if (json.has("suspend")) applySuspend(bp, json)
+        if (json.has("passCount")) {
+            val count = json.int("passCount") ?: 0
+            val props = bp.properties ?: throw ApiException(400, "pass count is not supported for ${kindOf(bp.type)}")
+            val enable = props.javaClass.methods.firstOrNull { it.name == "setCOUNT_FILTER_ENABLED" }
+            val set = props.javaClass.methods.firstOrNull { it.name == "setCOUNT_FILTER" }
+            if (enable == null || set == null) throw ApiException(400, "pass count is not supported for ${kindOf(bp.type)}")
+            enable.invoke(props, count > 0)
+            if (count > 0) set.invoke(props, count)
+        }
+        breakpointDto(project, bp) + mapOf("updated" to true)
+    }
+
     private fun stack(project: Project, id: String): List<Map<String, Any?>> {
         val session = requireSession(project, id)
         if (safe { session.isSuspended } != true) throw ApiException(409, "session is running")
-        val active = session.suspendContext?.activeExecutionStack
+        val active = currentStack(session) ?: session.suspendContext?.activeExecutionStack
         val frames = if (active == null) {
             listOfNotNull(session.currentStackFrame)
         } else {
@@ -852,7 +970,12 @@ private object BridgeServer {
         )
         val value = future.get(5, TimeUnit.SECONDS)
         val shown = present(value)
-        return mapOf("type" to shown.first, "value" to mask("expression", shown.second))
+        return mapOf(
+            "type" to shown.first,
+            "value" to mask("expression", shown.second),
+            "warning" to "evaluate ran code in the app. it can change state, and it can hang if it needs a lock held " +
+                "by a suspended thread. after a suspend=thread stop other threads keep running",
+        )
     }
 
     private fun readChildren(frame: XStackFrame): List<Pair<String, XValue>> {
@@ -979,10 +1102,21 @@ private object BridgeServer {
             "suspend" to bp.suspendPolicy.name.lowercase(),
             "enabled" to bp.isEnabled,
             "owned" to owned(id),
+            "logMessage" to bp.isLogMessage,
+            "logStack" to bp.isLogStack,
+            "logExpression" to bp.logExpressionObject?.expression,
+            "passCount" to passCount(bp),
         )
         if (kindOf(bp.type) == "exception") dto["className"] = exceptionName(bp).ifBlank { "*" }
         dto.putAll(verification(project, bp))
         return dto
+    }
+
+    private fun passCount(bp: XBreakpoint<*>): Int? = safe {
+        val props = bp.properties ?: return@safe null
+        val enabled = props.javaClass.methods.firstOrNull { it.name == "isCOUNT_FILTER_ENABLED" }?.invoke(props) as? Boolean
+        if (enabled != true) return@safe 0
+        props.javaClass.methods.firstOrNull { it.name == "getCOUNT_FILTER" }?.invoke(props) as? Int
     }
 
     private val verifiedIcons: Set<javax.swing.Icon> by lazy { debuggerIcons { "verified" in it } }
@@ -1261,6 +1395,120 @@ private object JavaDebug {
         }
     }
 
+    /** Every thread in the VM with its JDI status. frames > 0 adds that many top frames for suspended threads. */
+    fun threads(session: XDebugSession, frames: Int): List<Map<String, Any?>>? {
+        val process = process(session) ?: return null
+        return onManager(process, 10_000L) {
+            val ctxs = contexts(process)
+            val eventThreads = ctxs.mapNotNull { (call(it, "getEventThread") ?: call(it, "getThread"))?.let { t -> call(t, "name") } }.toSet()
+            val vm = call(call(process, "getVirtualMachineProxy")!!, "getVirtualMachine") as com.sun.jdi.VirtualMachine
+            vm.allThreads().map { thread ->
+                val suspended = thread.isSuspended
+                val out = linkedMapOf<String, Any?>(
+                    "name" to thread.name(),
+                    "status" to MirrorWalker.threadStatus(thread),
+                    "suspended" to suspended,
+                    "suspendCount" to thread.suspendCount(),
+                    "group" to runCatching { thread.threadGroup()?.name() }.getOrNull(),
+                    "stoppedHere" to (thread.name() in eventThreads),
+                )
+                if (suspended) {
+                    runCatching { thread.frameCount() }.getOrNull()?.let { out["frameCount"] = it }
+                    if (frames > 0) {
+                        val walker = MirrorWalker(SnapshotOptions(), { false })
+                        out["frames"] = runCatching {
+                            val count = thread.frameCount()
+                            thread.frames(0, minOf(frames, count)).mapIndexed { i, f -> walker.frame(i, f) }
+                        }.getOrElse { listOf(mapOf("error" to (it.message ?: it.javaClass.simpleName))) }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    private fun proxyByName(process: Any, name: String): Any {
+        val vmProxy = call(process, "getVirtualMachineProxy")!!
+        return (call(vmProxy, "allThreads") as Collection<*>).filterNotNull()
+            .firstOrNull { call(it, "name") == name }
+            ?: throw ApiException(404, "thread not found: $name")
+    }
+
+    /** The suspend context that holds this thread, and the thread proxy. */
+    private fun contextFor(process: Any, name: String?): Pair<Any, Any> {
+        val ctxs = contexts(process)
+        if (name == null) {
+            val ctx = ctxs.firstOrNull { (call(it, "getEventThread") ?: call(it, "getThread")) != null }
+                ?: throw ApiException(409, "no suspended thread")
+            return ctx to (call(ctx, "getEventThread") ?: call(ctx, "getThread"))!!
+        }
+        val proxy = proxyByName(process, name)
+        val own = ctxs.firstOrNull { (call(it, "getEventThread") ?: call(it, "getThread")) == proxy }
+        if (own != null) return own to proxy
+        val holder = ctxs.firstOrNull { safe { call(it, "suspends", proxy) } == true }
+            ?: throw ApiException(409, "thread $name is not suspended by the debugger")
+        return holder to proxy
+    }
+
+    fun step(session: XDebugSession, action: String, thread: String?): String? {
+        val process = process(session) ?: return null
+        return onManager(process) {
+            val (ctx, proxy) = contextFor(process, thread)
+            if ((call(ctx, "getThread")) != proxy) call(ctx, "resetThread", proxy)
+            val command = when (action) {
+                "STEP_OVER" -> call(process, "createStepOverCommand", ctx, false)
+                "STEP_INTO" -> call(process, "createStepIntoCommand", ctx, false, null)
+                else -> call(process, "createStepOutCommand", ctx)
+            }
+            call(call(process, "getManagerThread")!!, "schedule", command)
+            call(proxy, "name") as String
+        }
+    }
+
+    fun runToLine(session: XDebugSession, position: com.intellij.xdebugger.XSourcePosition, ignore: Boolean, thread: String?): String? {
+        val process = process(session) ?: return null
+        return onManager(process) {
+            val (ctx, proxy) = contextFor(process, thread)
+            if ((call(ctx, "getThread")) != proxy) call(ctx, "resetThread", proxy)
+            val command = call(process, "createRunToCursorCommand", ctx, position, ignore)
+            call(call(process, "getManagerThread")!!, "schedule", command)
+            call(proxy, "name") as String
+        }
+    }
+
+    /** Suspends one thread, like Suspend in the Threads view. */
+    fun freezeThread(session: XDebugSession, name: String): String? {
+        val process = process(session) ?: return null
+        return onManager(process) {
+            val proxy = proxyByName(process, name)
+            call(call(process, "getManagerThread")!!, "schedule", call(process, "createFreezeThreadCommand", proxy))
+            name
+        }
+    }
+
+    /** Resumes one thread. When the thread owns its suspend context, the context is resumed like Resume. */
+    fun resumeThread(session: XDebugSession, name: String): String? {
+        val process = process(session) ?: return null
+        return onManager(process) {
+            val (ctx, proxy) = contextFor(process, name)
+            val owns = (call(ctx, "getEventThread") ?: call(ctx, "getThread")) == proxy &&
+                info(ctx)["policy"] == "thread"
+            val command = if (owns) {
+                call(process, "createResumeCommand", ctx)
+            } else {
+                call(process, "createResumeThreadCommand", ctx, proxy)
+            }
+            call(call(process, "getManagerThread")!!, "schedule", command)
+            name
+        }
+    }
+
+    private fun <T> safe(block: () -> T): T? = try {
+        block()
+    } catch (_: Exception) {
+        null
+    }
+
     /** Last resort: resumes the whole VM. The IDE may still show the old suspend state. */
     fun resumeVm(session: XDebugSession): Boolean {
         val process = process(session) ?: return false
@@ -1318,7 +1566,15 @@ private object JavaDebug {
     private fun call(target: Any, name: String, vararg args: Any?): Any? {
         val method = target.javaClass.methods.firstOrNull { m ->
             m.name == name && m.parameterCount == args.size &&
-                m.parameterTypes.indices.all { args[it] == null || m.parameterTypes[it].isInstance(args[it]) }
+                m.parameterTypes.indices.all { i ->
+                    val type = m.parameterTypes[i]
+                    val arg = args[i]
+                    when {
+                        arg == null -> !type.isPrimitive
+                        type.isPrimitive -> type.kotlin.javaObjectType.isInstance(arg)
+                        else -> type.isInstance(arg)
+                    }
+                }
         } ?: throw IllegalStateException("no $name on ${target.javaClass.name}")
         return try {
             method.invoke(target, *args)
