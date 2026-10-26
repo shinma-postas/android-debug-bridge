@@ -52,6 +52,17 @@ def request(method, path, body=None, timeout=120, allow_eval=False):
         sys.exit(detail or f"HTTP {error.code}")
 
 
+def check_timeout(value, strict=False):
+    """--timeout is in milliseconds. Values under 1000 are almost always seconds by mistake."""
+    if value is None or value >= 1000:
+        return value
+    hint = f"--timeout is in milliseconds. {value} means {value} ms. For {value} seconds pass {value * 1000}."
+    if strict:
+        sys.exit(json.dumps({"error": hint}))
+    print("warning: " + hint, file=sys.stderr)
+    return value
+
+
 def only_session(explicit):
     if explicit:
         return explicit
@@ -111,6 +122,7 @@ def cmd_bp_clear(_):
 
 
 def cmd_attach(args):
+    check_timeout(args.timeout, strict=True)
     body = {"serial": args.serial, "timeout": args.timeout}
     if args.package:
         body["package"] = args.package
@@ -176,6 +188,7 @@ def do_attach(serial, package, timeout=60000, force=False, wait_for_process=Fals
 
 def cmd_restoration_debug(args):
     """BP1 + attach, then on app restart auto BP2 + force attach."""
+    check_timeout(args.attach_timeout, strict=True)
     package = args.package
     serial = args.serial
     interval = args.interval / 1000.0
@@ -249,6 +262,7 @@ def cmd_restoration_debug(args):
 
 
 def cmd_attach_wait(args):
+    check_timeout(args.timeout, strict=True)
     package = args.package
     deadline = time.time() + args.timeout / 1000.0
     if args.stop_sessions:
@@ -290,6 +304,7 @@ def cmd_attach_wait(args):
 
 
 def cmd_start(args):
+    check_timeout(args.timeout, strict=True)
     print(json.dumps(request("POST", "/v1/sessions", {
         "configuration": args.configuration,
         "timeout": args.timeout,
@@ -301,6 +316,7 @@ def cmd_sessions(_):
 
 
 def cmd_control(args):
+    check_timeout(args.timeout)
     session = only_session(args.session)
     print(json.dumps(request("POST", f"/v1/sessions/{session}/control", {
         "action": args.action,
@@ -355,7 +371,7 @@ def build_parser():
     attach = sub.add_parser("attach")
     attach.add_argument("--serial", required=True)
     attach.add_argument("--package", default="jp.co.persol.postas.selfregi")
-    attach.add_argument("--timeout", type=int, default=60000)
+    attach.add_argument("--timeout", type=int, default=60000, help="milliseconds. under 1000 is rejected")
     attach.add_argument("--force", action="store_true", help="stop existing IDE debug sessions before attach")
     attach.add_argument("--wait-for-process", action="store_true", help="poll until the package process appears")
     attach.set_defaults(func=cmd_attach)
@@ -435,6 +451,14 @@ def self_check():
     args = parser.parse_args(["control", "WAIT_FOR_PAUSE", "--timeout", "1000"])
     assert args.action == "WAIT_FOR_PAUSE" and args.timeout == 1000
     assert parser.parse_args(["control", "RESUME_VM"]).action == "RESUME_VM"
+    try:
+        cmd_attach(parser.parse_args(["attach", "--serial", "X", "--timeout", "30"]))
+    except SystemExit as error:
+        if "milliseconds" not in str(error):
+            raise
+    else:
+        raise SystemExit("attach --timeout 30 should stop")
+    assert check_timeout(30000, strict=True) == 30000
     try:
         cmd_eval(parser.parse_args(["eval", "1+1"]))
     except SystemExit as error:

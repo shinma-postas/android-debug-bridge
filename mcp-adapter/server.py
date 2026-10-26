@@ -56,7 +56,7 @@ TOOLS = [
             "properties": {
                 "serial": {"type": "string"},
                 "package": {"type": "string"},
-                "timeout": {"type": "integer"},
+                "timeout": {"type": "integer", "description": "milliseconds. under 1000 is rejected"},
                 "projectPath": {"type": "string"},
             },
             "required": ["serial"],
@@ -210,6 +210,8 @@ def call_tool(name, args):
         return bridge("DELETE", "/v1/breakpoints", project=project)
     if name == "attach":
         timeout = int(args.get("timeout") or 60000)
+        if timeout < 1000:
+            return json.dumps({"error": f"timeout is in milliseconds. got {timeout} ms. Use 30000 for 30 seconds"}), True
         body = {"serial": args["serial"], "timeout": timeout}
         if args.get("package"):
             body["package"] = args["package"]

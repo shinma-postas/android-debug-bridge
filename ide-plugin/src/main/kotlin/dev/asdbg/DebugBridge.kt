@@ -460,6 +460,9 @@ private object BridgeServer {
         val serial = json.str("serial") ?: throw ApiException(400, "serial is required")
         val packageName = json.str("package") ?: "jp.co.persol.postas.selfregi"
         val timeout = json.long("timeout") ?: 60_000L
+        if (timeout < 1_000L) {
+            throw ApiException(400, "timeout is in milliseconds. got $timeout ms. Use 30000 for 30 seconds")
+        }
         val force = json.bool("force")
         if (force) stopAllDebugSessions(project)
         val bridge = AndroidDebugBridge.getBridge() ?: throw ApiException(503, "adb bridge is not ready")
@@ -503,6 +506,7 @@ private object BridgeServer {
         if (client.isDebuggerAttached) {
             throw ApiException(409, "a debugger is already attached to ${clientLabel(client)}")
         }
+        val before = XDebuggerManager.getInstance(project).debugSessions.toSet()
         val session = try {
             runBlocking {
                 withTimeout(timeout) {
@@ -515,7 +519,10 @@ private object BridgeServer {
                 }
             }
         } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-            throw ApiException(504, "attach timed out")
+            // A cancelled attach can leave a session that keeps listening for JDWP. Stop only what this call made.
+            val leftover = XDebuggerManager.getInstance(project).debugSessions.filter { it !in before }
+            safe { edt { leftover.forEach { it.stop() } } }
+            throw ApiException(504, "attach timed out after $timeout ms. stopped ${leftover.size} half-open session(s)")
         }
         watch(session)
         return sessionDto(session) + mapOf(
