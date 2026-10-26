@@ -26,6 +26,8 @@ import com.intellij.xdebugger.XDebugSession
 import com.intellij.xdebugger.XDebugSessionListener
 import com.intellij.xdebugger.XDebuggerManager
 import com.intellij.xdebugger.XDebuggerManagerListener
+import com.intellij.xdebugger.breakpoints.SuspendPolicy
+import com.intellij.xdebugger.breakpoints.XBreakpoint
 import com.intellij.xdebugger.breakpoints.XBreakpointProperties
 import com.intellij.xdebugger.breakpoints.XBreakpointType
 import com.intellij.xdebugger.breakpoints.XLineBreakpoint
@@ -215,6 +217,7 @@ private object BridgeServer {
         when {
             method == "POST" && path == "/v1/breakpoints" -> send(exchange, 200, addBreakpoint(project, body(exchange)))
             method == "GET" && path == "/v1/breakpoints" -> send(exchange, 200, mapOf("breakpoints" to listBreakpoints(project)))
+            method == "DELETE" && path == "/v1/breakpoints" -> send(exchange, 200, clearAllBreakpoints(project))
             method == "DELETE" && path.startsWith("/v1/breakpoints/") -> {
                 removeBreakpoint(project, path.removePrefix("/v1/breakpoints/"))
                 send(exchange, 200, mapOf("removed" to true))
@@ -272,7 +275,33 @@ private object BridgeServer {
         throw ApiException(400, "set X-Project-Path. open=${open.map { it.basePath }}")
     }
 
+    private val breakpointKinds = mapOf(
+        "java-line" to "line",
+        "kotlin-line" to "line",
+        "java-method" to "method",
+        "kotlin-function" to "method",
+        "java-field" to "field",
+        "kotlin-field" to "field",
+        "java-exception" to "exception",
+    )
+
+    private fun normalizeKind(raw: String): String {
+        val kind = when (raw.lowercase()) {
+            "function" -> "method"
+            "watchpoint", "watch" -> "field"
+            else -> raw.lowercase()
+        }
+        if (kind !in setOf("line", "method", "field", "exception")) {
+            throw ApiException(400, "unknown breakpoint type $raw. known=line,method,field,exception")
+        }
+        return kind
+    }
+
+    private fun kindOf(type: XBreakpointType<*, *>): String = breakpointKinds[type.id] ?: type.id
+
     private fun addBreakpoint(project: Project, json: JsonObject): Map<String, Any?> = edtWrite {
+        val kind = normalizeKind(json.str("type") ?: "line")
+        if (kind == "exception") return@edtWrite addExceptionBreakpoint(project, json)
         val rel = json.str("file") ?: throw ApiException(400, "file is required")
         val line = json.int("line") ?: throw ApiException(400, "line is required")
         val line0 = line - 1
@@ -281,21 +310,95 @@ private object BridgeServer {
         val file = LocalFileSystem.getInstance().refreshAndFindFileByPath(abs)
             ?: throw ApiException(404, "file not found: $abs")
         val type = XBreakpointType.EXTENSION_POINT_NAME.extensionList
+            .filter { kindOf(it) == kind }
             .filterIsInstance<XLineBreakpointType<*>>()
             .sortedByDescending { it.priority }
             .firstOrNull { it.canPutAt(file, line0, project) }
-            ?: throw ApiException(400, "no breakpoint type for $abs:$line")
+            ?: throw ApiException(400, "cannot put $kind at $abs:$line. available=${availableKinds(project, file, line0)}")
         val condition = json.str("condition")
         val temporary = json.bool("temporary")
         val existing = findLineBreakpoint(project, type, file, line0)
         if (existing != null) {
-            if (owned(breakpointId(existing)) && !condition.isNullOrBlank()) existing.setCondition(condition)
+            if (owned(breakpointId(existing))) {
+                if (!condition.isNullOrBlank()) existing.setCondition(condition)
+                applySuspend(existing, json)
+            }
             return@edtWrite breakpointDto(project, existing) + mapOf("created" to false)
         }
         val bp = addLineBreakpoint(project, type, file, line0, temporary)
         markOwned(breakpointId(bp))
         if (!condition.isNullOrBlank()) bp.setCondition(condition)
+        applySuspend(bp, json)
         breakpointDto(project, bp) + mapOf("created" to true)
+    }
+
+    private fun applySuspend(bp: XBreakpoint<*>, json: JsonObject) {
+        val raw = json.str("suspend") ?: return
+        val policy = when (raw.lowercase()) {
+            "all" -> SuspendPolicy.ALL
+            "thread" -> SuspendPolicy.THREAD
+            "none" -> SuspendPolicy.NONE
+            else -> throw ApiException(400, "unknown suspend $raw. known=all,thread,none")
+        }
+        val lineType = bp.type as? XLineBreakpointType<*>
+        if (policy == SuspendPolicy.THREAD && lineType != null && !lineType.isSuspendThreadSupported) {
+            throw ApiException(400, "thread suspend is not supported for ${kindOf(bp.type)}")
+        }
+        bp.suspendPolicy = policy
+    }
+
+    private fun availableKinds(project: Project, file: VirtualFile, line0: Int): List<String> =
+        XBreakpointType.EXTENSION_POINT_NAME.extensionList
+            .filterIsInstance<XLineBreakpointType<*>>()
+            .filter { it.canPutAt(file, line0, project) }
+            .map { kindOf(it) }
+            .distinct()
+
+    private fun addExceptionBreakpoint(project: Project, json: JsonObject): Map<String, Any?> {
+        val className = json.str("class")
+            ?: throw ApiException(400, "class is required for type exception. Use * for any exception")
+        val wanted = if (className == "*") "" else className
+        val manager = XDebuggerManager.getInstance(project).breakpointManager
+        val type = XBreakpointType.EXTENSION_POINT_NAME.extensionList
+            .firstOrNull { it.id == "java-exception" }
+            ?: throw ApiException(400, "exception breakpoints are unavailable")
+        val existing = manager.allBreakpoints.firstOrNull {
+            it.type.id == "java-exception" && exceptionName(it) == wanted
+        }
+        if (existing != null) {
+            if (owned(breakpointId(existing))) applySuspend(existing, json)
+            return breakpointDto(project, existing) + mapOf("created" to false)
+        }
+        val props = type.createProperties()
+            ?: throw ApiException(500, "could not create exception breakpoint")
+        if (wanted.isNotEmpty()) setField(props, "myQualifiedName", wanted)
+        val bp = addGeneric(project, type, props)
+        markOwned(breakpointId(bp))
+        json.str("condition")?.let { bp.setCondition(it) }
+        applySuspend(bp, json)
+        return breakpointDto(project, bp) + mapOf("created" to true)
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun addGeneric(
+        project: Project,
+        type: XBreakpointType<*, *>,
+        props: XBreakpointProperties<*>,
+    ): XBreakpoint<*> {
+        val typed = type as XBreakpointType<XBreakpoint<XBreakpointProperties<*>>, XBreakpointProperties<*>>
+        return XDebuggerManager.getInstance(project).breakpointManager.addBreakpoint(typed, props)
+    }
+
+    private fun setField(target: Any, name: String, value: Any?) {
+        val field = target.javaClass.fields.firstOrNull { it.name == name }
+            ?: throw ApiException(500, "no field $name on ${target.javaClass.name}")
+        field.set(target, value)
+    }
+
+    private fun exceptionName(bp: XBreakpoint<*>): String {
+        val props = bp.properties ?: return ""
+        val value = props.javaClass.fields.firstOrNull { it.name == "myQualifiedName" }?.get(props) as? String
+        return value.orEmpty()
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -326,14 +429,20 @@ private object BridgeServer {
 
     private fun listBreakpoints(project: Project): List<Map<String, Any?>> = edtRead {
         XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints
-            .filterIsInstance<XLineBreakpoint<*>>()
             .map { breakpointDto(project, it) }
+    }
+
+    private fun clearAllBreakpoints(project: Project): Map<String, Any?> = edtWrite {
+        val manager = XDebuggerManager.getInstance(project).breakpointManager
+        val ids = manager.allBreakpoints.map { breakpointId(it) }
+        ids.forEach { unmarkOwned(it) }
+        manager.allBreakpoints.toList().forEach { manager.removeBreakpoint(it) }
+        mapOf("removed" to ids.size)
     }
 
     private fun removeBreakpoint(project: Project, id: String) = edtWrite {
         val decoded = URLDecoder.decode(id, StandardCharsets.UTF_8)
         val bp = XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints
-            .filterIsInstance<XLineBreakpoint<*>>()
             .firstOrNull { breakpointId(it) == decoded }
             ?: throw ApiException(404, "breakpoint not found")
         if (!owned(decoded)) throw ApiException(403, "breakpoint was not created by asdbg")
@@ -341,29 +450,53 @@ private object BridgeServer {
         unmarkOwned(decoded)
     }
 
+    private fun stopAllDebugSessions(project: Project) = edtWrite {
+        XDebuggerManager.getInstance(project).debugSessions.toList().forEach { it.stop() }
+    }
+
     private fun attachToProcess(project: Project, json: JsonObject): Map<String, Any?> {
         val serial = json.str("serial") ?: throw ApiException(400, "serial is required")
         val packageName = json.str("package") ?: "jp.co.persol.postas.selfregi"
         val timeout = json.long("timeout") ?: 60_000L
+        val force = json.bool("force")
+        if (force) stopAllDebugSessions(project)
         val bridge = AndroidDebugBridge.getBridge() ?: throw ApiException(503, "adb bridge is not ready")
         if (!bridge.isConnected) throw ApiException(503, "adb bridge is not connected")
         val devices = bridge.devices.toList()
         val device = devices.firstOrNull { matchesSerial(it.serialNumber, serial) }
             ?: throw ApiException(404, "device not found: $serial. known=${devices.map { it.serialNumber }}")
         if (!device.isOnline) throw ApiException(409, "device offline: ${device.serialNumber}")
-        val clients = device.clients.toList()
-        val client = pickClient(clients, packageName)
-            ?: throw ApiException(404, "debuggable process not found: $packageName. clients=${clients.map { clientLabel(it) }}")
+        val waitForProcess = json.bool("waitForProcess")
+        val client = if (waitForProcess) {
+            runBlocking {
+                withTimeout(timeout) {
+                    var found: Client? = null
+                    while (isActive) {
+                        found = pickClient(device.clients.toList(), packageName)
+                        if (found != null) break
+                        delay(400)
+                    }
+                    found ?: throw ApiException(404, "debuggable process not found: $packageName")
+                }
+            }
+        } else {
+            val clients = device.clients.toList()
+            pickClient(clients, packageName)
+                ?: throw ApiException(404, "debuggable process not found: $packageName. clients=${clients.map { clientLabel(it) }}")
+        }
         val debugger = AndroidJavaDebugger()
         if (!debugger.supportsProject(project)) throw ApiException(409, "Java debugger does not support this project")
-        debugger.getExistingDebugSession(project, client)?.let { existing ->
-            watch(existing)
-            return sessionDto(existing) + mapOf(
-                "attached" to false,
-                "already" to true,
-                "serial" to device.serialNumber,
-                "package" to packageName,
-            )
+        if (!force) {
+            debugger.getExistingDebugSession(project, client)?.let { existing ->
+                watch(existing)
+                return sessionDto(existing) + mapOf(
+                    "attached" to false,
+                    "already" to true,
+                    "serial" to device.serialNumber,
+                    "package" to packageName,
+                    "pid" to client.clientData.pid,
+                )
+            }
         }
         if (client.isDebuggerAttached) {
             throw ApiException(409, "a debugger is already attached to ${clientLabel(client)}")
@@ -680,21 +813,31 @@ private object BridgeServer {
         )
     }
 
-    private fun breakpointDto(project: Project, bp: XLineBreakpoint<*>): Map<String, Any?> {
+    private fun breakpointDto(project: Project, bp: XBreakpoint<*>): Map<String, Any?> {
         val id = breakpointId(bp)
-        return mapOf(
+        val lineBp = bp as? XLineBreakpoint<*>
+        val dto = mutableMapOf<String, Any?>(
             "id" to id,
-            "file" to relative(project, bp.fileUrl),
-            "line" to bp.line + 1,
+            "type" to kindOf(bp.type),
+            "file" to lineBp?.let { relative(project, it.fileUrl) },
+            "line" to lineBp?.let { it.line + 1 },
             "condition" to bp.conditionExpression?.expression,
-            "temporary" to bp.isTemporary,
+            "temporary" to (lineBp?.isTemporary ?: false),
+            "suspend" to bp.suspendPolicy.name.lowercase(),
             "enabled" to bp.isEnabled,
             "owned" to owned(id),
         )
+        if (kindOf(bp.type) == "exception") dto["className"] = exceptionName(bp).ifBlank { "*" }
+        return dto
     }
 
-    private fun breakpointId(bp: XLineBreakpoint<*>): String {
-        val raw = "${bp.type.id}\n${bp.fileUrl}\n${bp.line}"
+    private fun breakpointId(bp: XBreakpoint<*>): String {
+        val lineBp = bp as? XLineBreakpoint<*>
+        val raw = if (lineBp != null) {
+            "${bp.type.id}\n${lineBp.fileUrl}\n${lineBp.line}"
+        } else {
+            "${bp.type.id}\n${exceptionName(bp)}"
+        }
         val digest = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(StandardCharsets.UTF_8))
         return digest.take(8).joinToString("") { "%02x".format(it) }
     }

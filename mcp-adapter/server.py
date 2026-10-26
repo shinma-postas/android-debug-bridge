@@ -14,22 +14,24 @@ ENDPOINT = HOME / "endpoint.json"
 TOOLS = [
     {
         "name": "bp_add",
-        "description": "Add a line breakpoint in the open Android Studio project. line is 1-based.",
+        "description": "Add a breakpoint. type is line (default), method, field, or exception. line, method, and field need file and a 1-based line. method goes on a function declaration, field on a property declaration. exception needs className, or * for any exception.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "type": {"type": "string", "enum": ["line", "method", "field", "exception"]},
                 "file": {"type": "string"},
                 "line": {"type": "integer"},
+                "className": {"type": "string"},
                 "condition": {"type": "string"},
+                "suspend": {"type": "string", "enum": ["all", "thread", "none"]},
                 "temporary": {"type": "boolean"},
                 "projectPath": {"type": "string"},
             },
-            "required": ["file", "line"],
         },
     },
     {
         "name": "bp_list",
-        "description": "List line breakpoints.",
+        "description": "List breakpoints. Each item has type: line, method, field, or exception.",
         "inputSchema": {"type": "object", "properties": {"projectPath": {"type": "string"}}},
     },
     {
@@ -40,6 +42,11 @@ TOOLS = [
             "properties": {"id": {"type": "string"}, "projectPath": {"type": "string"}},
             "required": ["id"],
         },
+    },
+    {
+        "name": "bp_clear",
+        "description": "Remove every breakpoint in the IDE for this project.",
+        "inputSchema": {"type": "object", "properties": {"projectPath": {"type": "string"}}},
     },
     {
         "name": "attach",
@@ -183,19 +190,33 @@ def session_id(args):
 def call_tool(name, args):
     project = args.get("projectPath")
     if name == "bp_add":
-        body = {"file": args["file"], "line": args["line"], "temporary": bool(args.get("temporary"))}
+        kind = args.get("type") or "line"
+        body = {"type": kind, "temporary": bool(args.get("temporary"))}
         if args.get("condition"):
             body["condition"] = args["condition"]
+        if args.get("suspend"):
+            body["suspend"] = args["suspend"]
+        if kind == "exception":
+            body["class"] = args.get("className") or args.get("class")
+        else:
+            body["file"] = args["file"]
+            body["line"] = args["line"]
         return bridge("POST", "/v1/breakpoints", body, project)
     if name == "bp_list":
         return bridge("GET", "/v1/breakpoints", project=project)
     if name == "bp_remove":
         return bridge("DELETE", "/v1/breakpoints/" + args["id"], project=project)
+    if name == "bp_clear":
+        return bridge("DELETE", "/v1/breakpoints", project=project)
     if name == "attach":
         timeout = int(args.get("timeout") or 60000)
         body = {"serial": args["serial"], "timeout": timeout}
         if args.get("package"):
             body["package"] = args["package"]
+        if args.get("force"):
+            body["force"] = True
+        if args.get("waitForProcess"):
+            body["waitForProcess"] = True
         return bridge("POST", "/v1/attach", body, project, timeout=timeout / 1000 + 5)
     if name == "start":
         timeout = int(args.get("timeout") or 30000)
