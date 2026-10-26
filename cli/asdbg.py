@@ -13,7 +13,7 @@ from pathlib import Path
 
 HOME = Path.home() / ".android-debug-bridge"
 ENDPOINT = HOME / "endpoint.json"
-ACTIONS = ("PAUSE", "RESUME", "STEP_OVER", "STEP_INTO", "STEP_OUT", "STOP", "WAIT_FOR_PAUSE")
+ACTIONS = ("PAUSE", "RESUME", "RESUME_VM", "STEP_OVER", "STEP_INTO", "STEP_OUT", "STOP", "WAIT_FOR_PAUSE")
 
 
 def endpoint():
@@ -404,7 +404,10 @@ def build_parser():
     sub.add_parser("sessions").set_defaults(func=cmd_sessions)
     sub.add_parser("status").set_defaults(func=cmd_sessions)
 
-    control = sub.add_parser("control")
+    control = sub.add_parser(
+        "control",
+        help="RESUME also resumes suspend=thread stops; RESUME_VM resumes the whole VM as a last resort",
+    )
     control.add_argument("action", choices=ACTIONS)
     control.add_argument("--session")
     control.add_argument("--timeout", type=int, default=60000)
@@ -431,6 +434,7 @@ def self_check():
     assert args.type == "exception" and args.class_name == "java.lang.NullPointerException"
     args = parser.parse_args(["control", "WAIT_FOR_PAUSE", "--timeout", "1000"])
     assert args.action == "WAIT_FOR_PAUSE" and args.timeout == 1000
+    assert parser.parse_args(["control", "RESUME_VM"]).action == "RESUME_VM"
     try:
         cmd_eval(parser.parse_args(["eval", "1+1"]))
     except SystemExit as error:

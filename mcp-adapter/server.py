@@ -82,7 +82,7 @@ TOOLS = [
     },
     {
         "name": "control",
-        "description": "PAUSE, RESUME, STEP_OVER, STEP_INTO, STEP_OUT, STOP, or WAIT_FOR_PAUSE.",
+        "description": "PAUSE, RESUME, RESUME_VM, STEP_OVER, STEP_INTO, STEP_OUT, STOP, or WAIT_FOR_PAUSE. RESUME also resumes suspend=thread stops. RESUME_VM resumes the whole VM as a last resort.",
         "inputSchema": {
             "type": "object",
             "properties": {

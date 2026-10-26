@@ -27,6 +27,17 @@ python3 cli/asdbg.py control STEP_OVER
 python3 cli/asdbg.py control RESUME
 ```
 
+### suspend=thread で止めたとき
+
+`--suspend thread` のブレークポイントで止まると、Android Studio のセッションは suspended にならないことがある。
+
+- `sessions` の `threadSuspended` が `true` なら、どれかのスレッドが止まっている。`suspendedThreads` にスレッド名と suspend policy が出る。取れないときは `null`。
+- `control RESUME` は、セッションが suspended ならこれまでどおり再開する。そうでなければ止まっているスレッドを Android Studio の Resume と同じ方法で再開し、`resumed` に再開したスレッドを返す。止まっているものが無ければ 409 `session is running`。
+- `control RESUME_VM` は VM ごと再開する。RESUME で戻らないときの最後の手段。Android Studio の表示が止まったままになることがある。
+- `control WAIT_FOR_PAUSE` はスレッド単位の停止も `paused` で返す。そのときは `threadLevel: true` と `suspendedThreads` が付く。
+- `control STOP` は止める前のセッション id を返す。
+- `stack`、`vars`、`eval` は、これまでどおりセッションが suspended のときだけ使える。
+
 `eval` は対象プロセスで式を実行する。`--allow` が無いと送らない。削除できるブレークポイントは、このブリッジが作ったものだけ。
 
 ## MCP
