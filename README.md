@@ -11,7 +11,7 @@ cd ide-plugin
 ./gradlew buildPlugin
 ```
 
-`ide-plugin/build/distributions/android-debug-bridge-0.1.5.zip` ができる。この zip を Android Studio の plugins に展開し、Android Studio を再起動する。起動後に `~/.android-debug-bridge/endpoint.json` と `token` ができる。
+`ide-plugin/build/distributions/android-debug-bridge-0.1.6.zip` ができる。この zip を Android Studio の plugins に展開し、Android Studio を再起動する。起動後に `~/.android-debug-bridge/endpoint.json` と `token` ができる。
 
 ## CLI
 
@@ -101,7 +101,7 @@ Debug ウィンドウの操作との対応:
 | 停止時の情報をまとめて取る | 追加 | `snapshot`、`control WAIT_FOR_PAUSE --snapshot` |
 | Stop と Detach | Stop は既存、Detach は追加 | `control STOP`、`detach` |
 | attach 前の準備待ち | 追加 | `attach --wait-ready` |
-| 値の書き換え（Set Value） | 未実装。次の段階。下の設計メモ | |
+| 値の書き換え（Set Value） | 0.1.6 で追加。止まっている間に値を書く | `set`、`resume-with`、`control SET_VALUE` |
 | Drop Frame（フレームを戻す） | 未実装。API（`createPopFrameCommand`）はある。戻した分の副作用は戻らないので、要るときに足す | |
 | Force Return、Throw Exception | 未実装。JDI の `forceEarlyReturn` は Android の ART で使えないことがある | |
 | Watches | 作らない。Android Studio の画面の状態で、CLI では `eval` を毎回呼べば同じ | |
@@ -160,15 +160,61 @@ snapshot には会員情報、決済の値、端末の識別子などがその�
 - プラグインと CLI は値を外へ送らない。
 - 結果をチャット、イシュー、外部のサービスに貼るときは、カード番号、POICHI token、端末 ID、シリアルを伏せる。
 
-### 値の書き換え（次の段階の設計メモ）
+### 値の書き換え（Set Value、0.1.6）
 
-今は読むだけ。書き換えは別の action `SET_VALUE` として足す予定。
+止まっている間にフレームの値を書き換えられる。プリミティブ、String、null、enum 定数はメソッドを呼ばないので、`suspend=thread` の停止でも使える。`eval` と違って式は実行しないので `--allow` ヘッダは要らない。
 
-- 入力は snapshot と同じ `frameIndex` と、`this.payment.amount` のような名前のパス、新しい値。
-- パスは snapshot と同じ順にたどる。ローカル変数は `StackFrame.setValue`、フィールドは `ObjectReference.setValue`、配列は `ArrayReference.setValue`。
-- 新しい値はプリミティブ、String（`vm.mirrorOf`）、null だけにする。型が合わなければ 400。
-- 実行はデバッガのマネージャスレッドで、`X-ASdbg-Allow-Eval` と同じような明示ヘッダが無ければ断る。
-- 書いたあと、そのノードを読み直して返す。Android Studio の Variables 表示は次の停止まで古いままのことがある。
+対象:
+
+- フレームのローカル変数（例 `amount`）
+- `this` のフィールド（例 `this.payment.amount`）
+- フィールドや配列要素をたどったパス（例 `responsePay.result.code`、`arr[2]`、`grid[0][1].cell`）
+- 完全修飾の静的フィールド（例 `com.example.Foo.FIELD`）
+
+値（1 つだけ指定する）:
+
+- プリミティブ `--int` / `--long` / `--short` / `--byte` / `--double` / `--float` / `--boolean` / `--char`（型チェックつき）
+- `--string`（`vm.mirrorOf` でミラーを作る）
+- `--null`（オブジェクト参照のフィールドだけ）
+- `--enum PAID`（宣言型の enum 定数を名前で解決）
+- 既存オブジェクトを id で代入するのは未対応（`--object-id` は予約。400 を返す）
+
+使い方:
+
+```
+# 1 つ書く
+asdbg set responsePay.result.code --int 200
+
+# 書いてそのまま再開する
+asdbg set this.payment.amount --long 0 --resume
+
+# 別スレッド・別フレームを指定
+asdbg set flag --boolean true --thread main --frame 1
+
+# 複数まとめて書いてから再開する
+asdbg resume-with --json '[{"path":"a.code","value":{"int":"200"}},{"path":"a.paid","value":{"boolean":true}}]'
+```
+
+`control SET_VALUE`（および MCP の `set_value`）も同じことをする。body は 1 件なら `path` と `value`、複数なら `sets=[{path,value}]`、どちらも `resume=true` で設定後に再開できる。`frameIndex` は省略すると現在のフレーム（0）。
+
+動き:
+
+- ローカル変数は `StackFrame.setValue`、フィールドは `ObjectReference.setValue`、配列は `ArrayReference.setValue`、静的は `ClassType.setValue`。すべてデバッガのマネージャスレッドで実行する。
+- 書いたあとに読み直して、古い値と新しい値を返す。名前が secret 系なら `***` にする。
+- Android Studio の Variables 表示は次の停止まで古いままのことがある。
+
+エラー（4xx）:
+
+- 型が合わない → 400
+- 配列の範囲外 → 400
+- 見つからないパス（最適化で消えた・スコープ外・未定義のフィールド）→ 404 / 409
+- スレッドが止まっていない、指定したフレームが無い → 409
+- `final` フィールド → JDI が書けてしまうことがあるので止めず、`warning` を付けて返す
+
+リスク:
+
+- これは稼働中の決済フローの状態を書き換える。`responsePay.result.code` のような値を変えると、後続の処理が実機で本当に分岐する。試験の意図した範囲だけに使う。
+- 書き込む値・返る値には会員情報や決済の値が入りうる。外に貼らない。
 
 `eval` は対象プロセスで式を実行する。`--allow` が無いと送らない。削除できるブレークポイントは、このブリッジが作ったものだけ。
 
@@ -180,7 +226,7 @@ Cursor の MCP 設定に次を足す。
 python3 /Users/shinma.takahashi/Develop/selfregi/android-debug-bridge/mcp-adapter/server.py
 ```
 
-ツール: `bp_add`、`bp_list`、`bp_update`、`bp_remove`、`bp_clear`、`attach`、`start`、`sessions`、`mute`、`control`、`threads`、`snapshot`、`stack`、`variables`、`evaluate`。
+ツール: `bp_add`、`bp_list`、`bp_update`、`bp_remove`、`bp_clear`、`attach`、`start`、`sessions`、`mute`、`control`、`threads`、`snapshot`、`stack`、`variables`、`evaluate`、`set_value`。
 
 - `control` の action は CLI と同じ。`SUSPEND_THREAD`、`RESUME_THREAD`、`STEP_*` は `thread`、`RUN_TO_LINE` は `file` と `line`、`SELECT_FRAME` は `frameIndex` と `thread` を取る。`DETACH` も使える。
 - `attach` は `waitReady: true` で準備を待つ。
