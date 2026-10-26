@@ -69,7 +69,8 @@ class PauseHooksTest {
         assertEquals(
             listOf(
                 "event", "kind", "source", "sessionId", "sessionName", "project", "file", "line", "class", "method",
-                "thread", "threadLevel", "policy", "breakpointId", "timestamp", "pluginVersion", "seq",
+                "thread", "threadLevel", "policy", "contextPolicy", "breakpointPolicy", "breakpointId", "timestamp",
+                "pluginVersion", "seq",
             ),
             p.keys.toList(),
         )
@@ -175,5 +176,96 @@ class PauseHooksTest {
         assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0) < 3000)
         assertTrue((r["http"] as String).startsWith("error: http"))
         assertFalse(r.toString().contains("127.0.0.1:1/x"))
+    }
+
+    @Test
+    fun jdiAndBreakpointPolicyNames() {
+        assertEquals("none", PauseMapping.jdiPolicy(0))
+        assertEquals("thread", PauseMapping.jdiPolicy(1))
+        assertEquals("all", PauseMapping.jdiPolicy(2))
+        assertEquals("unknown", PauseMapping.jdiPolicy(null))
+        assertEquals("thread", PauseMapping.breakpointPolicy("THREAD"))
+        assertEquals("all", PauseMapping.breakpointPolicy("ALL"))
+        assertNull(PauseMapping.breakpointPolicy("bogus"))
+        assertNull(PauseMapping.breakpointPolicy(null))
+    }
+
+    @Test
+    fun threadBreakpointHitReportsThreadLevel() {
+        // 16:48:57 real-device case: suspend=thread BP, sessions threadSuspended=true.
+        val p = PauseMapping.policy("breakpoint", "thread", "thread")
+        assertEquals("thread", p.policy)
+        assertTrue(p.threadLevel)
+        assertEquals("thread", p.contextPolicy)
+        assertEquals("thread", p.breakpointPolicy)
+    }
+
+    @Test
+    fun breakpointPolicyWinsButThreadLevelFollowsContext() {
+        // BP configured thread, but the VM suspended all (e.g. another suspend=all request in the same event set).
+        val p = PauseMapping.policy("breakpoint", "all", "thread")
+        assertEquals("thread", p.policy)
+        assertFalse(p.threadLevel)
+        assertEquals("all", p.contextPolicy)
+    }
+
+    @Test
+    fun breakpointPolicyUsedWhenContextUnknown() {
+        val p = PauseMapping.policy("breakpoint", "unknown", "thread")
+        assertEquals("thread", p.policy)
+        assertTrue(p.threadLevel)
+        assertNull(p.contextPolicy)
+        val none = PauseMapping.policy("breakpoint", null, null)
+        assertEquals("unknown", none.policy)
+        assertFalse(none.threadLevel)
+    }
+
+    @Test
+    fun nonBreakpointStopsIgnoreBreakpointPolicy() {
+        val step = PauseMapping.policy("step", "thread", "all")
+        assertEquals("thread", step.policy)
+        assertTrue(step.threadLevel)
+        assertNull(step.breakpointPolicy)
+        val pause = PauseMapping.policy("pause", "all", null)
+        assertEquals("all", pause.policy)
+        assertFalse(pause.threadLevel)
+    }
+
+    @Test
+    fun classAndMethodPreferJdiLocation() {
+        assertEquals(
+            "jp.co.example.SrSelfTicketActivity" to "onClick",
+            PauseMapping.classAndMethod("jp.co.example.SrSelfTicketActivity", "onClick", "other:1, X (y)"),
+        )
+    }
+
+    @Test
+    fun classAndMethodFromFrameText() {
+        assertEquals(
+            "jp.co.example.SrSelfTicketActivity" to "onClick",
+            PauseMapping.classAndMethod(null, null, "onClick:4627, SrSelfTicketActivity (jp.co.example)"),
+        )
+        assertEquals(
+            "jp.co.example.SrSelfTicketActivity\$a\$1" to "invoke",
+            PauseMapping.classAndMethod(
+                null,
+                null,
+                "invoke:12, SrSelfTicketActivity\$a\$1 {jp.co.example.SrSelfTicketActivity\$a\$1} (jp.co.example)",
+            ),
+        )
+        assertEquals("Foo" to "<init>", PauseMapping.classAndMethod(null, null, "<init>:3, Foo"))
+        assertEquals("a.B" to "m", PauseMapping.classAndMethod("a.B", null, "m:3, B (a)"))
+        assertEquals(null to null, PauseMapping.classAndMethod(null, null, "\"main\"@1 in group \"main\": RUNNING"))
+        assertEquals(null to null, PauseMapping.classAndMethod(null, null, null))
+    }
+
+    @Test
+    fun dedupMatchesThreadWhenLinesDiffer() {
+        val d = PauseDedup(1500)
+        d.markJdi("s", 4627, 0, "main")
+        assertTrue(d.seenByJdi("s", 4626, 300, "main"))
+        assertFalse(d.seenByJdi("s", 4626, 300, "worker"))
+        assertFalse(d.seenByJdi("s", 4626, 300, null))
+        assertFalse(d.seenByJdi("s", 4627, 1600, "main"))
     }
 }

@@ -518,7 +518,7 @@ def handle(message):
             "result": {
                 "protocolVersion": requested,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "android-studio-debug", "version": "0.1.7"},
+                "serverInfo": {"name": "android-studio-debug", "version": "0.1.8"},
             },
         }
     if method == "tools/list":

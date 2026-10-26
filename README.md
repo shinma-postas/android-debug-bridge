@@ -11,7 +11,7 @@ cd ide-plugin
 ./gradlew buildPlugin
 ```
 
-`ide-plugin/build/distributions/android-debug-bridge-0.1.7.zip` ができる。この zip を Android Studio の plugins に展開し、Android Studio を再起動する。起動後に `~/.android-debug-bridge/endpoint.json` と `token` ができる。
+`ide-plugin/build/distributions/android-debug-bridge-0.1.8.zip` ができる。この zip を Android Studio の plugins に展開し、Android Studio を再起動する。起動後に `~/.android-debug-bridge/endpoint.json` と `token` ができる。
 
 ## CLI
 
@@ -231,7 +231,7 @@ asdbg resume-with --json '[{"path":"a.code","value":{"int":"200"}},{"path":"a.pa
 JSON の例:
 
 ```
-{"event":"paused","kind":"breakpoint","source":"jdi","sessionId":"a1b2c3","sessionName":"app","project":"selfregi-for-android","file":"app/src/main/java/com/example/MainActivity.kt","line":42,"class":"com.example.MainActivity","method":"onCreate","thread":"main","threadLevel":true,"policy":"thread","breakpointId":"5f0c...","timestamp":"2026-10-26T16:40:00.123+09:00","pluginVersion":"0.1.7","seq":1}
+{"event":"paused","kind":"breakpoint","source":"jdi","sessionId":"a1b2c3","sessionName":"app","project":"selfregi-for-android","file":"app/src/main/java/com/example/MainActivity.kt","line":42,"class":"com.example.MainActivity","method":"onCreate","thread":"main","threadLevel":true,"policy":"thread","contextPolicy":"thread","breakpointPolicy":"thread","breakpointId":"5f0c...","timestamp":"2026-10-26T16:40:00.123+09:00","pluginVersion":"0.1.8","seq":1}
 ```
 
 - `kind` は `breakpoint`、`step`、`exception`、`method`、`field`、`pause`、`run_to_line`、`other` のどれか。

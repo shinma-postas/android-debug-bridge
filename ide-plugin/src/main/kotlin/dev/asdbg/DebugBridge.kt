@@ -99,6 +99,7 @@ private object BridgeServer {
     private var server: HttpServer? = null
     private val hooks = PauseHooks(home, log = { log.warn(it) })
     private val dedup = PauseDedup()
+    private val jdiListening = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<XDebugSession, Boolean>())
     private val lastAction = ConcurrentHashMap<String, Pair<String, Long>>()
 
     fun start() {
@@ -200,26 +201,40 @@ private object BridgeServer {
 
     private fun watch(session: XDebugSession) {
         if (!sessions.markWatched(session)) return
-        JavaDebug.addPauseListener(session) { raw ->
-            if (hooks.active()) {
-                ApplicationManager.getApplication().executeOnPooledThread { emitJdiPause(session, raw) }
-            }
-        }
+        ensurePauseListener(session)
         session.addSessionListener(object : XDebugSessionListener {
             override fun sessionPaused() {
                 sessions.fire(session, "paused")
                 if (hooks.active()) {
+                    // The JDI process may not have existed when the session was first watched; retry so later stops use it.
+                    ensurePauseListener(session)
                     val pos = position(session)
                     val stack = safe { session.suspendContext?.activeExecutionStack?.displayName }
-                    ApplicationManager.getApplication().executeOnPooledThread { emitSessionPause(session, pos, stack) }
+                    val frameText = safe {
+                        session.currentStackFrame?.let { f -> SimpleColoredText().also { f.customizeTextPresentation(it) }.toString() }
+                    }
+                    ApplicationManager.getApplication().executeOnPooledThread { emitSessionPause(session, pos, stack, frameText) }
                 }
             }
 
             override fun sessionStopped() {
                 sessions.fire(session, "stopped")
                 sessions.remove(session)
+                synchronized(jdiListening) { jdiListening.remove(session) }
             }
         })
+    }
+
+    /** Adds the JDI pause listener once per session. Returns false (and the session listener stays the only source) when not attachable yet. */
+    private fun ensurePauseListener(session: XDebugSession): Boolean = synchronized(jdiListening) {
+        if (session in jdiListening) return@synchronized true
+        val ok = JavaDebug.addPauseListener(session) { raw ->
+            if (hooks.active()) {
+                ApplicationManager.getApplication().executeOnPooledThread { emitJdiPause(session, raw) }
+            }
+        }
+        if (ok) jdiListening.add(session) else log.info("asdbg: JDI pause listener not attached yet; session listener fallback in use")
+        ok
     }
 
     private fun route(exchange: HttpExchange, token: String) {
@@ -1163,16 +1178,19 @@ private object BridgeServer {
         val id = sessions.idOf(session)
         val project = session.project
         val line = raw["line"] as? Int
-        dedup.markJdi(id, line, System.currentTimeMillis())
+        val thread = raw["thread"] as? String
+        dedup.markJdi(id, line, System.currentTimeMillis(), thread)
         val file = (raw["sourcePath"] as? String)?.let { resolveSource(project, it) } ?: raw["sourcePath"] as? String
-        val bpId = if (raw["kind"] == "breakpoint") lineBreakpointId(project, file, line) else null
+        val bp = if (raw["kind"] == "breakpoint") lineBreakpoint(project, file, line) else null
+        val bpId = bp?.first
         val kind = when {
             raw["kind"] == "breakpoint" && bpId == null && recentAction(id) == "RUN_TO_LINE" -> "run_to_line"
             raw["kind"] != null -> raw["kind"] as String
             recentAction(id) == "PAUSE" -> "pause"
             else -> "other"
         }
-        val policy = raw["policy"] as? String
+        val p = PauseMapping.policy(kind, raw["policy"] as? String, bp?.second)
+        val (cls, method) = PauseMapping.classAndMethod(raw["class"] as? String, raw["method"] as? String, null)
         hooks.emit(
             PauseEvent(
                 kind = kind,
@@ -1182,30 +1200,38 @@ private object BridgeServer {
                 project = project.name,
                 file = file,
                 line = line,
-                className = raw["class"] as? String,
-                method = raw["method"] as? String,
-                thread = raw["thread"] as? String,
-                threadLevel = policy == "thread",
-                policy = policy,
+                className = cls,
+                method = method,
+                thread = thread,
+                threadLevel = p.threadLevel,
+                policy = p.policy,
+                contextPolicy = p.contextPolicy,
+                breakpointPolicy = p.breakpointPolicy,
                 breakpointId = bpId,
             ),
         )
     }
 
     // Fallback for stops the JDI listener did not report (or non-Java sessions). Waits briefly so the JDI event wins.
-    private fun emitSessionPause(session: XDebugSession, pos: Map<String, Any?>?, stack: String?) = safe<Unit> {
+    private fun emitSessionPause(session: XDebugSession, pos: Map<String, Any?>?, stack: String?, frameText: String?) = safe<Unit> {
         Thread.sleep(300)
         val id = sessions.idOf(session)
         val line = pos?.get("line") as? Int
-        if (dedup.seenByJdi(id, line, System.currentTimeMillis())) return@safe
+        val threadName = stack?.let { Regex("^\"([^\"]+)\"").find(it)?.groupValues?.get(1) ?: it.substringBefore(' ') }
+        if (dedup.seenByJdi(id, line, System.currentTimeMillis(), threadName)) return@safe
         val file = pos?.get("file") as? String
-        val bpId = lineBreakpointId(session.project, file, line)
+        val bp = lineBreakpoint(session.project, file, line)
+        val bpId = bp?.first
         val kind = when (recentAction(id)) {
             "PAUSE" -> "pause"
             "STEP_OVER", "STEP_INTO", "STEP_OUT" -> "step"
             "RUN_TO_LINE" -> "run_to_line"
             else -> if (bpId != null) "breakpoint" else "other"
         }
+        // Same JDI suspend contexts that `sessions` reads for threadSuspended, never a hard-coded policy.
+        val facts = JavaDebug.stopFacts(session, threadName, line)
+        val p = PauseMapping.policy(kind, facts?.get("policy") as? String, bp?.second)
+        val (cls, method) = PauseMapping.classAndMethod(facts?.get("class") as? String, facts?.get("method") as? String, frameText)
         hooks.emit(
             PauseEvent(
                 kind = kind,
@@ -1215,9 +1241,13 @@ private object BridgeServer {
                 project = session.project.name,
                 file = file,
                 line = line,
-                thread = stack?.let { Regex("^\"([^\"]+)\"").find(it)?.groupValues?.get(1) ?: it.substringBefore(' ') },
-                threadLevel = false,
-                policy = "all",
+                className = cls,
+                method = method,
+                thread = threadName ?: facts?.get("thread") as? String,
+                threadLevel = p.threadLevel,
+                policy = p.policy,
+                contextPolicy = p.contextPolicy,
+                breakpointPolicy = p.breakpointPolicy,
                 breakpointId = bpId,
             ),
         )
@@ -1226,14 +1256,16 @@ private object BridgeServer {
     private fun recentAction(id: String): String? =
         lastAction[id]?.takeIf { System.currentTimeMillis() - it.second < 60_000 }?.first
 
-    private fun lineBreakpointId(project: Project, file: String?, line: Int?): String? {
+    /** id and configured suspend policy ("all"/"thread"/"none") of the enabled line breakpoint at file:line. */
+    private fun lineBreakpoint(project: Project, file: String?, line: Int?): Pair<String, String?>? {
         if (file == null || line == null) return null
         return safe {
-            ReadAction.compute<String?, RuntimeException> {
-                XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints
+            ReadAction.compute<Pair<String, String?>?, RuntimeException> {
+                val matches = XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints
                     .filterIsInstance<XLineBreakpoint<*>>()
-                    .firstOrNull { it.line + 1 == line && relative(project, it.fileUrl) == file }
-                    ?.let { breakpointId(it) }
+                    .filter { it.line + 1 == line && relative(project, it.fileUrl) == file }
+                val bp = matches.firstOrNull { it.isEnabled } ?: matches.firstOrNull()
+                bp?.let { breakpointId(it) to PauseMapping.breakpointPolicy(it.suspendPolicy.name) }
             }
         }
     }
@@ -1552,18 +1584,42 @@ private object JavaDebug {
         val eventSet = runCatching { call(context, "getEventSet") as? com.sun.jdi.event.EventSet }.getOrNull()
         out["kind"] = eventSet?.let { kindOf(it) }
         val located = eventSet?.firstOrNull { it is com.sun.jdi.event.LocatableEvent } as? com.sun.jdi.event.LocatableEvent
-        val location = located?.location() ?: runCatching {
-            val proxy = call(context, "getEventThread") ?: call(context, "getThread")
-            val thread = proxy?.let { call(it, "getThreadReference") } as? com.sun.jdi.ThreadReference
-            thread?.takeIf { it.isSuspended && it.frameCount() > 0 }?.frame(0)?.location()
-        }.getOrNull()
-        if (location != null) {
-            out["class"] = runCatching { location.declaringType().name() }.getOrNull()
-            out["method"] = runCatching { location.method().name() }.getOrNull()
-            out["line"] = location.lineNumber().takeIf { it > 0 }
-            out["sourcePath"] = runCatching { location.sourcePath() }.getOrNull()
-        }
+        val location = runCatching { located?.location() }.getOrNull() ?: frameLocation(context)
+        out.putAll(locationFacts(location))
         return out
+    }
+
+    private fun frameLocation(context: Any): com.sun.jdi.Location? = runCatching {
+        val proxy = call(context, "getEventThread") ?: call(context, "getThread")
+        val thread = proxy?.let { call(it, "getThreadReference") } as? com.sun.jdi.ThreadReference
+        thread?.takeIf { it.isSuspended && it.frameCount() > 0 }?.frame(0)?.location()
+    }.getOrNull()
+
+    private fun locationFacts(location: com.sun.jdi.Location?): Map<String, Any?> {
+        if (location == null) return emptyMap()
+        return mapOf(
+            "class" to runCatching { location.declaringType().name() }.getOrNull(),
+            "method" to runCatching { location.method().name() }.getOrNull(),
+            "line" to location.lineNumber().takeIf { it > 0 },
+            "sourcePath" to runCatching { location.sourcePath() }.getOrNull(),
+        )
+    }
+
+    /**
+     * Policy, thread and top-frame location of the suspend context that matches [threadName] (else [line], else the first).
+     * Reads the same contexts as [suspendedThreads], which backs `sessions` threadSuspended. null when not Java or nothing is suspended.
+     */
+    fun stopFacts(session: XDebugSession, threadName: String?, line: Int?): Map<String, Any?>? = try {
+        val process = process(session) ?: return null
+        onManager(process) {
+            val located = contexts(process).map { c -> Triple(c, info(c), frameLocation(c)) }
+            val pick = located.firstOrNull { threadName != null && it.second["thread"] == threadName }
+                ?: located.firstOrNull { line != null && it.third?.lineNumber() == line }
+                ?: located.firstOrNull()
+            pick?.let { (_, info, loc) -> info + locationFacts(loc) }
+        }
+    } catch (_: Exception) {
+        null
     }
 
     private fun kindOf(set: com.sun.jdi.event.EventSet): String? {
@@ -2012,12 +2068,7 @@ private object JavaDebug {
 
     private fun info(context: Any): Map<String, Any?> {
         val thread = call(context, "getEventThread") ?: call(context, "getThread")
-        val policy = when (call(context, "getSuspendPolicy") as? Int) {
-            0 -> "none"
-            1 -> "thread"
-            2 -> "all"
-            else -> "unknown"
-        }
+        val policy = PauseMapping.jdiPolicy(runCatching { call(context, "getSuspendPolicy") as? Int }.getOrNull())
         return mapOf("thread" to thread?.let { call(it, "name") as? String }, "policy" to policy)
     }
 

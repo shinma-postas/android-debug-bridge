@@ -22,7 +22,7 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
-internal const val ASDBG_VERSION = "0.1.7"
+internal const val ASDBG_VERSION = "0.1.8"
 
 /**
  * Pause hooks config, stored in ~/.android-debug-bridge/webhook.json. Off by default.
@@ -133,6 +133,8 @@ internal data class PauseEvent(
     val thread: String? = null,
     val threadLevel: Boolean = false,
     val policy: String? = null,
+    val contextPolicy: String? = null,
+    val breakpointPolicy: String? = null,
     val breakpointId: String? = null,
 )
 
@@ -153,6 +155,8 @@ internal object PausePayload {
         "thread" to e.thread,
         "threadLevel" to e.threadLevel,
         "policy" to e.policy,
+        "contextPolicy" to e.contextPolicy,
+        "breakpointPolicy" to e.breakpointPolicy,
         "breakpointId" to e.breakpointId,
         "timestamp" to now.truncatedTo(ChronoUnit.MILLIS).format(iso),
         "pluginVersion" to ASDBG_VERSION,
@@ -173,8 +177,59 @@ internal object PausePayload {
         thread = "main",
         threadLevel = false,
         policy = "all",
+        contextPolicy = "all",
+        breakpointPolicy = "all",
         breakpointId = null,
     )
+}
+
+/**
+ * Pure mapping from the debugger facts of one stop to the event fields, kept free of IDE types so it can be unit-tested.
+ * contextPolicy is the JDI suspend context's own policy, the same source `sessions` uses for suspendedThreads.
+ * breakpointPolicy is the hit breakpoint's configured suspend policy (only for kind=breakpoint).
+ */
+internal object PauseMapping {
+    private val known = setOf("all", "thread", "none")
+
+    data class Policy(val policy: String, val threadLevel: Boolean, val contextPolicy: String?, val breakpointPolicy: String?)
+
+    /** SuspendContext.getSuspendPolicy(): JDI EventRequest SUSPEND_NONE / SUSPEND_EVENT_THREAD / SUSPEND_ALL. */
+    fun jdiPolicy(raw: Int?): String = when (raw) {
+        0 -> "none"
+        1 -> "thread"
+        2 -> "all"
+        else -> "unknown"
+    }
+
+    /** XBreakpoint SuspendPolicy enum name (ALL / THREAD / NONE). */
+    fun breakpointPolicy(name: String?): String? = name?.lowercase()?.takeIf { it in known }
+
+    /**
+     * policy: the breakpoint's own setting on a breakpoint hit, otherwise the suspend context's policy.
+     * threadLevel: what the VM actually did (context policy == thread); falls back to policy when the context is unknown.
+     */
+    fun policy(kind: String?, contextPolicy: String?, breakpointPolicy: String?): Policy {
+        val ctx = contextPolicy?.lowercase()?.takeIf { it in known }
+        val bp = breakpointPolicy?.lowercase()?.takeIf { it in known && kind == "breakpoint" }
+        val policy = bp ?: ctx ?: "unknown"
+        val threadLevel = if (ctx != null) ctx == "thread" else policy == "thread"
+        return Policy(policy, threadLevel, ctx, bp)
+    }
+
+    // IntelliJ Java frame text: "onClick:4627, SrSelfTicketActivity (jp.co.example)" or with the runtime class in braces:
+    // "invoke:12, SrSelfTicketActivity$a$1 {jp.co.example.SrSelfTicketActivity$a$1} (jp.co.example)".
+    private val frameText = Regex("""^\s*([\w$<>\-]+):\d+,\s+([\w$]+)(?:\s+\{([\w.$]+)\})?(?:\s+\(([\w.]+)\))?""")
+
+    /** class and method from the JDI Location when present, else parsed from the IDE stack frame text. */
+    fun classAndMethod(declaringType: String?, method: String?, frameText: String?): Pair<String?, String?> {
+        val cls = declaringType?.takeIf { it.isNotBlank() }
+        val m = method?.takeIf { it.isNotBlank() }
+        if (cls != null && m != null) return cls to m
+        val match = frameText?.let { this.frameText.find(it) } ?: return cls to m
+        val (fm, simple, runtime, pkg) = match.destructured
+        val parsedClass = runtime.ifBlank { null } ?: if (pkg.isNotBlank()) "$pkg.$simple" else simple
+        return (cls ?: parsedClass) to (m ?: fm)
+    }
 }
 
 /** Drops repeats: the same session+thread+line within debounceMs. */
@@ -400,16 +455,23 @@ internal class PauseHooks(
 
 /** Pairs a JDI pause with the XDebugSession pause for the same stop so only one event goes out. */
 internal class PauseDedup(private val windowMs: Long = 1_500) {
-    private val jdi = ConcurrentHashMap<String, Pair<Int?, Long>>()
+    private data class Mark(val line: Int?, val thread: String?, val atMs: Long)
+    private val jdi = ConcurrentHashMap<String, Mark>()
 
-    fun markJdi(sessionId: String, line: Int?, nowMs: Long) {
-        jdi[sessionId] = line to nowMs
+    fun markJdi(sessionId: String, line: Int?, nowMs: Long, thread: String? = null) {
+        jdi[sessionId] = Mark(line, thread, nowMs)
     }
 
-    /** True when a session-level pause already went out through the JDI listener. */
-    fun seenByJdi(sessionId: String, line: Int?, nowMs: Long): Boolean {
+    /**
+     * True when a session-level pause already went out through the JDI listener. Matches on the line or the thread,
+     * because the JDI line (Kotlin inline/SMAP) and the IDE position line can differ for the same stop.
+     */
+    fun seenByJdi(sessionId: String, line: Int?, nowMs: Long, thread: String? = null): Boolean {
         val prev = jdi[sessionId] ?: return false
-        return nowMs - prev.second < windowMs && (line == null || prev.first == null || prev.first == line)
+        if (nowMs - prev.atMs >= windowMs) return false
+        val sameLine = line == null || prev.line == null || prev.line == line
+        val sameThread = thread != null && prev.thread != null && prev.thread == thread
+        return sameLine || sameThread
     }
 }
 
