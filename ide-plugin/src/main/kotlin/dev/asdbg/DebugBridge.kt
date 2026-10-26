@@ -13,6 +13,8 @@ import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.application.WriteAction
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.editor.colors.TextAttributesKey
+import com.intellij.icons.AllIcons
+import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.project.ProjectManagerListener
@@ -467,6 +469,15 @@ private object BridgeServer {
         if (timeout < 1_000L) {
             throw ApiException(400, "timeout is in milliseconds. got $timeout ms. Use 30000 for 30 seconds")
         }
+        val warnings = mutableListOf<String>()
+        // A breakpoint placed while the project is indexing or still opening may not reach the VM.
+        val waitedForIndex = if (json.bool("waitReady")) waitForSmartMode(project, timeout - 1_000L) else 0L
+        if (!project.isInitialized) warnings += "project is not fully loaded yet. breakpoints may not be registered"
+        if (DumbService.isDumb(project)) {
+            warnings += "project is indexing (dumb mode). breakpoints may not hit until it ends. " +
+                "pass waitReady to wait, and check verified in bp-list after attach"
+        }
+        val attachTimeout = (timeout - waitedForIndex).coerceAtLeast(1_000L)
         val force = json.bool("force")
         if (force) stopAllDebugSessions(project)
         val bridge = AndroidDebugBridge.getBridge() ?: throw ApiException(503, "adb bridge is not ready")
@@ -478,7 +489,7 @@ private object BridgeServer {
         val waitForProcess = json.bool("waitForProcess")
         val client = if (waitForProcess) {
             runBlocking {
-                withTimeout(timeout) {
+                withTimeout(attachTimeout) {
                     var found: Client? = null
                     while (isActive) {
                         found = pickClient(device.clients.toList(), packageName)
@@ -501,6 +512,8 @@ private object BridgeServer {
                 return sessionDto(existing) + mapOf(
                     "attached" to false,
                     "already" to true,
+                    "warnings" to warnings,
+                    "waitedReadyMs" to waitedForIndex,
                     "serial" to device.serialNumber,
                     "package" to packageName,
                     "pid" to client.clientData.pid,
@@ -513,7 +526,7 @@ private object BridgeServer {
         val before = XDebuggerManager.getInstance(project).debugSessions.toSet()
         val session = try {
             runBlocking {
-                withTimeout(timeout) {
+                withTimeout(attachTimeout) {
                     DebugSessionStarter.attachDebuggerToClientAndShowTab(
                         project,
                         client,
@@ -526,15 +539,27 @@ private object BridgeServer {
             // A cancelled attach can leave a session that keeps listening for JDWP. Stop only what this call made.
             val leftover = XDebuggerManager.getInstance(project).debugSessions.filter { it !in before }
             safe { edt { leftover.forEach { it.stop() } } }
-            throw ApiException(504, "attach timed out after $timeout ms. stopped ${leftover.size} half-open session(s)")
+            throw ApiException(504, "attach timed out after $attachTimeout ms. stopped ${leftover.size} half-open session(s)")
         }
         watch(session)
         return sessionDto(session) + mapOf(
             "attached" to true,
+            "warnings" to warnings,
+            "waitedReadyMs" to waitedForIndex,
             "serial" to device.serialNumber,
             "package" to packageName,
             "pid" to client.clientData.pid,
         )
+    }
+
+    /** Waits while the project is indexing (dumb mode) or still opening. Returns the time waited in ms. */
+    private fun waitForSmartMode(project: Project, limitMs: Long): Long {
+        val started = System.currentTimeMillis()
+        while (System.currentTimeMillis() - started < limitMs) {
+            if (project.isInitialized && !DumbService.isDumb(project)) break
+            Thread.sleep(250)
+        }
+        return System.currentTimeMillis() - started
     }
 
     private fun matchesSerial(actual: String, wanted: String): Boolean =
@@ -630,6 +655,10 @@ private object BridgeServer {
                     edt { session.stepOut() }
                 }
                 "STOP" -> edt { session.stop() }
+                "MUTE", "UNMUTE" -> {
+                    edt { session.setBreakpointMuted(action == "MUTE") }
+                    extra["muted"] = safe { session.areBreakpointsMuted() }
+                }
                 "WAIT_FOR_PAUSE" -> {
                     val paused = waitPause(session, timeout)
                     if (!json.bool("snapshot") || paused["event"] != "paused") return paused
@@ -902,6 +931,8 @@ private object BridgeServer {
             "suspended" to (safe { session.isSuspended } ?: false),
             "threadSuspended" to threads?.isNotEmpty(),
             "suspendedThreads" to threads,
+            "muted" to safe { session.areBreakpointsMuted() },
+            "projectIndexing" to safe { DumbService.isDumb(session.project) },
             "position" to position(session),
         )
     }
@@ -950,7 +981,55 @@ private object BridgeServer {
             "owned" to owned(id),
         )
         if (kindOf(bp.type) == "exception") dto["className"] = exceptionName(bp).ifBlank { "*" }
+        dto.putAll(verification(project, bp))
         return dto
+    }
+
+    private val verifiedIcons: Set<javax.swing.Icon> by lazy { debuggerIcons { "verified" in it } }
+    private val invalidIcons: Set<javax.swing.Icon> by lazy { debuggerIcons { "invalid" in it } }
+
+    private fun debuggerIcons(match: (String) -> Boolean): Set<javax.swing.Icon> =
+        AllIcons.Debugger::class.java.fields
+            .filter { match(it.name.lowercase()) && javax.swing.Icon::class.java.isAssignableFrom(it.type) }
+            .mapNotNull { safe { it.get(null) as? javax.swing.Icon } }
+            .toSet()
+
+    /**
+     * Whether the debugger registered the breakpoint in the VM, read from the gutter icon the session set.
+     * verified: requests exist in the VM. invalid: the debugger rejected it (see verifyError).
+     * pending: a session runs but has not set an icon yet, usually because the class is not loaded yet.
+     * unknown: no running session, or the state could not be read.
+     */
+    private fun verification(project: Project, bp: XBreakpoint<*>): Map<String, Any?> {
+        val running = XDebuggerManager.getInstance(project).debugSessions.filter { !it.isStopped }
+        if (running.isEmpty()) return mapOf("verified" to "unknown")
+        if (bp !is XLineBreakpoint<*>) return mapOf("verified" to "unknown")
+        var pending = false
+        for (session in running) {
+            val presentation = safe {
+                session.javaClass.methods.firstOrNull { it.name == "getBreakpointPresentation" && it.parameterCount == 1 }
+                    ?.invoke(session, bp)
+            }
+            if (presentation == null) {
+                pending = true
+                continue
+            }
+            val icon = call(presentation, "getIcon") as? javax.swing.Icon
+            val error = call(presentation, "getErrorMessage") as? String
+            val name = icon?.toString()?.lowercase().orEmpty()
+            val state = when {
+                icon in invalidIcons || "invalid" in name -> "invalid"
+                icon in verifiedIcons || "verified" in name || "valid" in name -> "verified"
+                !error.isNullOrBlank() -> "invalid"
+                else -> "unknown"
+            }
+            return mapOf("verified" to state, "verifyError" to error, "verifySession" to sessions.idOf(session))
+        }
+        return mapOf("verified" to if (pending) "pending" else "unknown")
+    }
+
+    private fun call(target: Any, name: String): Any? = safe {
+        target.javaClass.methods.firstOrNull { it.name == name && it.parameterCount == 0 }?.invoke(target)
     }
 
     private fun breakpointId(bp: XBreakpoint<*>): String {

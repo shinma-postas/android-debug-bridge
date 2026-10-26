@@ -13,7 +13,7 @@ from pathlib import Path
 
 HOME = Path.home() / ".android-debug-bridge"
 ENDPOINT = HOME / "endpoint.json"
-ACTIONS = ("PAUSE", "RESUME", "RESUME_VM", "STEP_OVER", "STEP_INTO", "STEP_OUT", "STOP", "WAIT_FOR_PAUSE", "SNAPSHOT")
+ACTIONS = ("PAUSE", "RESUME", "RESUME_VM", "STEP_OVER", "STEP_INTO", "STEP_OUT", "STOP", "WAIT_FOR_PAUSE", "SNAPSHOT", "MUTE", "UNMUTE")
 
 
 def endpoint():
@@ -77,7 +77,7 @@ def only_session(explicit):
 
 def cmd_tools(_):
     print("\n".join([
-        "bp-add", "bp-list", "bp-rm", "bp-clear", "attach", "attach-wait", "restoration-debug", "start", "sessions", "control", "snapshot", "stack", "vars", "eval",
+        "bp-add", "bp-list", "bp-rm", "bp-clear", "attach", "attach-wait", "restoration-debug", "start", "sessions", "mute", "control", "snapshot", "stack", "vars", "eval",
     ]))
 
 
@@ -131,7 +131,12 @@ def cmd_attach(args):
         body["force"] = True
     if args.wait_for_process:
         body["waitForProcess"] = True
-    print(json.dumps(request("POST", "/v1/attach", body, timeout=max(args.timeout / 1000 + 5, 10)), indent=2))
+    if args.wait_ready:
+        body["waitReady"] = True
+    result = request("POST", "/v1/attach", body, timeout=max(args.timeout / 1000 + 5, 10))
+    for warning in result.get("warnings") or []:
+        print("warning: " + warning, file=sys.stderr)
+    print(json.dumps(result, indent=2))
 
 
 def adb_pid(serial, package):
@@ -373,6 +378,18 @@ def cmd_snapshot(args):
     ), indent=2, ensure_ascii=False))
 
 
+def cmd_mute(args):
+    on = args.state == "on"
+    ids = [args.session] if args.session else [item["id"] for item in request("GET", "/v1/sessions")["sessions"]]
+    if not ids:
+        sys.exit("no debug session. mute is per session in Android Studio")
+    results = [
+        request("POST", f"/v1/sessions/{sid}/control", {"action": "MUTE" if on else "UNMUTE"}, timeout=30)
+        for sid in ids
+    ]
+    print(json.dumps({"muted": on, "sessions": results}, indent=2))
+
+
 def cmd_stack(args):
     session = only_session(args.session)
     print(json.dumps(request("GET", f"/v1/sessions/{session}/stack"), indent=2))
@@ -423,6 +440,11 @@ def build_parser():
     attach.add_argument("--timeout", type=int, default=60000, help="milliseconds. under 1000 is rejected")
     attach.add_argument("--force", action="store_true", help="stop existing IDE debug sessions before attach")
     attach.add_argument("--wait-for-process", action="store_true", help="poll until the package process appears")
+    attach.add_argument(
+        "--wait-ready",
+        action="store_true",
+        help="wait within --timeout until the project finishes indexing and loading before attach",
+    )
     attach.set_defaults(func=cmd_attach)
 
     attach_wait = sub.add_parser(
@@ -467,6 +489,10 @@ def build_parser():
     start.set_defaults(func=cmd_start)
 
     sub.add_parser("sessions").set_defaults(func=cmd_sessions)
+    mute = sub.add_parser("mute", help="mute or unmute all breakpoints. every session unless --session")
+    mute.add_argument("state", choices=["on", "off"])
+    mute.add_argument("--session")
+    mute.set_defaults(func=cmd_mute)
     sub.add_parser("status").set_defaults(func=cmd_sessions)
 
     control = sub.add_parser(
@@ -520,6 +546,8 @@ def self_check():
     else:
         raise SystemExit("attach --timeout 30 should stop")
     assert check_timeout(30000, strict=True) == 30000
+    assert parser.parse_args(["attach", "--serial", "X", "--wait-ready"]).wait_ready
+    assert parser.parse_args(["mute", "off"]).state == "off"
     try:
         cmd_eval(parser.parse_args(["eval", "1+1"]))
     except SystemExit as error:

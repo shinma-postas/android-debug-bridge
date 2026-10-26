@@ -69,6 +69,9 @@ TOOLS = [
                 "serial": {"type": "string"},
                 "package": {"type": "string"},
                 "timeout": {"type": "integer", "description": "milliseconds. under 1000 is rejected"},
+                "force": {"type": "boolean"},
+                "waitForProcess": {"type": "boolean"},
+                "waitReady": {"type": "boolean", "description": "wait within timeout until indexing and project loading end. the reply has warnings when not ready"},
                 "projectPath": {"type": "string"},
             },
             "required": ["serial"],
@@ -106,6 +109,15 @@ TOOLS = [
                 "projectPath": {"type": "string"},
             },
             "required": ["action"],
+        },
+    },
+    {
+        "name": "mute",
+        "description": "Mute or unmute all breakpoints, like Mute Breakpoints in the Debug window. Applies to every session unless sessionId is given. sessions shows muted.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"muted": {"type": "boolean"}, "sessionId": {"type": "string"}, "projectPath": {"type": "string"}},
+            "required": ["muted"],
         },
     },
     {
@@ -245,6 +257,8 @@ def call_tool(name, args):
             body["force"] = True
         if args.get("waitForProcess"):
             body["waitForProcess"] = True
+        if args.get("waitReady"):
+            body["waitReady"] = True
         return bridge("POST", "/v1/attach", body, project, timeout=timeout / 1000 + 5)
     if name == "start":
         timeout = int(args.get("timeout") or 30000)
@@ -264,6 +278,24 @@ def call_tool(name, args):
         extra = int(args.get("snapshotTimeout") or 10000) / 1000
         return bridge("POST", f"/v1/sessions/{sid}/control", body, project,
                       allow_eval=bool(args.get("toString")), timeout=timeout / 1000 + extra + 5)
+    if name == "mute":
+        if args.get("sessionId"):
+            ids = [args["sessionId"]]
+        else:
+            text, failed = bridge("GET", "/v1/sessions", project=project)
+            if failed:
+                return text, True
+            ids = [item["id"] for item in json.loads(text)["sessions"]]
+        if not ids:
+            return json.dumps({"error": "no debug session. mute is per session"}), True
+        action = "MUTE" if args.get("muted") else "UNMUTE"
+        results = []
+        for sid in ids:
+            text, failed = bridge("POST", f"/v1/sessions/{sid}/control", {"action": action}, project, timeout=30)
+            if failed:
+                return text, True
+            results.append(json.loads(text))
+        return json.dumps({"muted": bool(args.get("muted")), "sessions": results}), False
     if name == "snapshot":
         body = {"action": "SNAPSHOT"}
         body.update(snapshot_body(args))
