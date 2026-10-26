@@ -16,6 +16,9 @@ import com.intellij.openapi.editor.colors.TextAttributesKey
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
 import com.intellij.openapi.project.ProjectManagerListener
+import com.intellij.openapi.roots.ProjectRootManager
+import com.intellij.psi.search.FilenameIndex
+import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.VirtualFileManager
@@ -229,7 +232,8 @@ private object BridgeServer {
             method == "GET" && path == "/v1/sessions" -> send(exchange, 200, mapOf("sessions" to listSessions(project)))
             method == "POST" && path.matches(Regex("/v1/sessions/[^/]+/control")) -> {
                 val id = path.removePrefix("/v1/sessions/").removeSuffix("/control")
-                send(exchange, 200, control(project, id, body(exchange)))
+                val allowCalls = exchange.requestHeaders.getFirst("X-ASdbg-Allow-Eval") == "1"
+                send(exchange, 200, control(project, id, body(exchange), allowCalls))
             }
             method == "GET" && path.matches(Regex("/v1/sessions/[^/]+/stack")) -> {
                 val id = path.removePrefix("/v1/sessions/").removeSuffix("/stack")
@@ -590,7 +594,7 @@ private object BridgeServer {
             sessionDto(it)
         }
 
-    private fun control(project: Project, id: String, json: JsonObject): Map<String, Any?> {
+    private fun control(project: Project, id: String, json: JsonObject, allowCalls: Boolean = false): Map<String, Any?> {
         val action = json.str("action") ?: throw ApiException(400, "action is required")
         val timeout = json.long("timeout") ?: 60_000L
         val session = requireSession(project, id)
@@ -626,7 +630,18 @@ private object BridgeServer {
                     edt { session.stepOut() }
                 }
                 "STOP" -> edt { session.stop() }
-                "WAIT_FOR_PAUSE" -> return waitPause(session, timeout)
+                "WAIT_FOR_PAUSE" -> {
+                    val paused = waitPause(session, timeout)
+                    if (!json.bool("snapshot") || paused["event"] != "paused") return paused
+                    return paused + try {
+                        mapOf("snapshot" to snapshot(session, snapshotOptions(json), allowCalls))
+                    } catch (e: ApiException) {
+                        mapOf("snapshotError" to e.message)
+                    } catch (e: Exception) {
+                        mapOf("snapshotError" to (e.message ?: e.javaClass.simpleName))
+                    }
+                }
+                "SNAPSHOT" -> return snapshot(session, snapshotOptions(json), allowCalls)
                 else -> throw ApiException(400, "unsupported action: $action")
             }
         }
@@ -670,6 +685,75 @@ private object BridgeServer {
         val threads = JavaDebug.suspendedThreads(session)
         if (threads.isNullOrEmpty()) return null
         return pausedEvent(session, id) + mapOf("threadLevel" to true, "suspendedThreads" to threads)
+    }
+
+    private fun snapshotOptions(json: JsonObject): SnapshotOptions = SnapshotOptions(
+        frameIndex = json.int("frameIndex") ?: 0,
+        depth = json.int("depth") ?: 2,
+        maxChildren = json.int("maxChildren") ?: 50,
+        maxString = json.int("maxString") ?: 1000,
+        maxNodes = json.int("maxNodes") ?: 2000,
+        maxFrames = json.int("maxFrames") ?: 200,
+        timeoutMs = json.long("snapshotTimeout") ?: 10_000L,
+        thread = json.str("thread"),
+        toStringCalls = json.bool("toString"),
+    ).clamp()
+
+    // Everything the IDE debugger shows for one suspended thread, read from JDI mirrors. Read-only.
+    private fun snapshot(session: XDebugSession, opts: SnapshotOptions, allowCalls: Boolean): Map<String, Any?> {
+        if (opts.toStringCalls && !allowCalls) {
+            throw ApiException(403, "toString runs code in the process. It requires X-ASdbg-Allow-Eval: 1")
+        }
+        val started = System.currentTimeMillis()
+        val read = JavaDebug.snapshot(session, opts) { secretName.containsMatchIn(it) }
+            ?: throw ApiException(409, "not a Java debug session")
+        val (body, walker, thread) = read
+        val project = session.project
+        val cache = HashMap<String, String?>()
+        @Suppress("UNCHECKED_CAST")
+        val frames = body["frames"] as List<MutableMap<String, Any?>>
+        @Suppress("UNCHECKED_CAST")
+        val location = body["location"] as MutableMap<String, Any?>
+        (frames + location).forEach { frame ->
+            if (!frame.containsKey("file")) {
+                val source = frame["sourcePath"] as? String
+                frame["file"] = source?.let { cache.getOrPut(it) { resolveSource(project, it) } }
+            }
+        }
+        val breakpoint = safe {
+            ReadAction.compute<Map<String, Any?>?, RuntimeException> {
+                val file = location["file"] as? String
+                val line = location["line"] as? Int
+                XDebuggerManager.getInstance(project).breakpointManager.allBreakpoints
+                    .filterIsInstance<XLineBreakpoint<*>>()
+                    .firstOrNull { file != null && it.line + 1 == line && relative(project, it.fileUrl) == file }
+                    ?.let { breakpointDto(project, it) }
+            }
+        }
+        val toStringNote = if (opts.toStringCalls) PauseReader.addToStrings(thread, walker, opts.maxString) else null
+        val out = linkedMapOf<String, Any?>("sessionId" to sessions.idOf(session))
+        out.putAll(body)
+        out["breakpoint"] = breakpoint
+        out["nodes"] = walker.nodes
+        out["truncated"] = walker.truncated || (body["framesTruncated"] == true)
+        out["truncatedReason"] = walker.truncatedReason
+        if (toStringNote != null) out["toStringNote"] = toStringNote
+        out["limits"] = opts.dto()
+        out["elapsedMs"] = System.currentTimeMillis() - started
+        return out
+    }
+
+    /** Maps a JDI source path (package/File.kt) to a project file, relative to the project. */
+    private fun resolveSource(project: Project, sourcePath: String): String? = safe {
+        ReadAction.compute<String?, RuntimeException> {
+            val byRoot = ProjectRootManager.getInstance(project).contentSourceRoots
+                .firstNotNullOfOrNull { it.findFileByRelativePath(sourcePath) }
+            val file = byRoot ?: run {
+                val name = sourcePath.substringAfterLast('/')
+                FilenameIndex.getVirtualFilesByName(name, GlobalSearchScope.projectScope(project)).singleOrNull()
+            }
+            file?.let { relative(project, it.url) }
+        }
     }
 
     private fun stack(project: Project, id: String): List<Map<String, Any?>> {
@@ -1058,6 +1142,46 @@ private object JavaDebug {
         }
     }
 
+    /**
+     * Pause snapshot of one suspended thread: the event thread of a suspend context, or the named thread.
+     * JDI mirrors only, on the debugger manager thread. null when the session is not a Java session.
+     */
+    fun snapshot(
+        session: XDebugSession,
+        opts: SnapshotOptions,
+        isSecret: (String) -> Boolean,
+    ): Triple<MutableMap<String, Any?>, MirrorWalker, com.sun.jdi.ThreadReference>? {
+        val process = process(session) ?: return null
+        return onManager(process, opts.timeoutMs + 2_000L) {
+            val ctxs = contexts(process)
+            val infos = ctxs.map { info(it) }
+            val withThread = ctxs.mapNotNull { c ->
+                (call(c, "getEventThread") ?: call(c, "getThread"))?.let { c to it }
+            }
+            var policy = infos.firstOrNull()?.get("policy") as? String ?: "unknown"
+            var thread: com.sun.jdi.ThreadReference? = null
+            val wanted = opts.thread
+            val match = withThread.firstOrNull { (_, proxy) -> wanted == null || call(proxy, "name") == wanted }
+            if (match != null) {
+                thread = call(match.second, "getThreadReference") as com.sun.jdi.ThreadReference
+                policy = info(match.first)["policy"] as? String ?: policy
+            } else {
+                val vm = call(call(process, "getVirtualMachineProxy")!!, "getVirtualMachine") as com.sun.jdi.VirtualMachine
+                thread = vm.allThreads().firstOrNull { it.name() == (wanted ?: "main") && it.isSuspended }
+            }
+            if (thread == null) throw ApiException(409, "no suspended thread${wanted?.let { " named $it" } ?: ""}")
+            if (!thread.isSuspended) throw ApiException(409, "thread ${thread.name()} is running")
+            val (body, walker) = PauseReader.read(thread, opts, isSecret)
+            @Suppress("UNCHECKED_CAST")
+            (body["thread"] as MutableMap<String, Any?>).apply {
+                put("policy", policy)
+                put("threadLevel", policy == "thread")
+            }
+            body["suspendedThreads"] = infos
+            Triple(body, walker, thread)
+        }
+    }
+
     /** Last resort: resumes the whole VM. The IDE may still show the old suspend state. */
     fun resumeVm(session: XDebugSession): Boolean {
         val process = process(session) ?: return false
@@ -1089,7 +1213,7 @@ private object JavaDebug {
         return mapOf("thread" to thread?.let { call(it, "name") as? String }, "policy" to policy)
     }
 
-    private fun <T> onManager(process: Any, block: () -> T): T {
+    private fun <T> onManager(process: Any, timeoutMs: Long = TIMEOUT_MS, block: () -> T): T {
         val manager = call(process, "getManagerThread")!!
         val schedule = manager.javaClass.methods.first {
             it.name == "schedule" && it.parameterCount == 2 && it.parameterTypes[1] == Runnable::class.java
@@ -1104,7 +1228,7 @@ private object JavaDebug {
             }
         })
         return try {
-            future.get(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            future.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
             throw ApiException(504, "debugger manager thread did not answer")
         } catch (e: java.util.concurrent.ExecutionException) {

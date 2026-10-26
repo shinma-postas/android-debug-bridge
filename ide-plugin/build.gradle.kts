@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "dev.asdbg"
-version = "0.1.4"
+version = "0.1.5"
 
 repositories {
     mavenCentral()
@@ -19,6 +19,12 @@ dependencies {
         bundledPlugin("org.jetbrains.android")
     }
     compileOnly(files("/Applications/Android Studio.app/Contents/lib/intellij.libraries.gson.jar"))
+    testImplementation("junit:junit:4.13.2")
+    testImplementation(files("/Applications/Android Studio.app/Contents/lib/intellij.libraries.gson.jar"))
+}
+
+tasks.test {
+    systemProperty("asdbg.exampleOut", System.getProperty("user.home") + "/Downloads/asdbg-snapshot-example.json")
 }
 
 kotlin {
@@ -31,7 +37,7 @@ intellijPlatform {
     pluginConfiguration {
         id = "dev.asdbg.bridge"
         name = "Android Debug Bridge"
-        version = "0.1.4"
+        version = "0.1.5"
         ideaVersion {
             sinceBuild = "262.9437"
             untilBuild = "262.*"
