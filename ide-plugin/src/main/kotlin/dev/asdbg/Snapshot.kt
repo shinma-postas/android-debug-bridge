@@ -417,3 +417,99 @@ internal object PauseReader {
         }
     }
 }
+
+/** A step in a value path: a field or local name, or an array index. */
+internal sealed class PathToken {
+    data class Name(val name: String) : PathToken()
+    data class Index(val index: Int) : PathToken()
+}
+
+/** What value to write. Kept free of JDI so it can be unit tested. */
+internal sealed class ValueSpec {
+    object Null : ValueSpec()
+    data class Str(val value: String) : ValueSpec()
+    data class EnumConst(val name: String) : ValueSpec()
+    data class ObjId(val id: Long) : ValueSpec()
+
+    /** kind is one of the PRIMITIVES names; raw is the textual form from JSON or the CLI. */
+    data class Prim(val kind: String, val raw: String) : ValueSpec()
+}
+
+/** Pure parsing and conversion for SET_VALUE. No JDI, so unit tests cover it. */
+internal object SetValue {
+    val PRIMITIVES = setOf("int", "long", "short", "byte", "double", "float", "boolean", "char")
+
+    /** `responsePay.result.code`, `arr[2]`, `this.payment.amount`, `com.example.Foo.FIELD`. */
+    fun parsePath(path: String): List<PathToken> {
+        val s = path.trim()
+        require(s.isNotEmpty()) { "empty path" }
+        val tokens = mutableListOf<PathToken>()
+        var i = 0
+        while (i < s.length) {
+            when (val c = s[i]) {
+                '.' -> {
+                    i++
+                    require(i < s.length && s[i] != '.' && s[i] != '[') { "unexpected '.' in path: $path" }
+                }
+                '[' -> {
+                    val close = s.indexOf(']', i)
+                    require(close > i) { "missing ']' in path: $path" }
+                    val num = s.substring(i + 1, close).trim()
+                    val idx = num.toIntOrNull() ?: throw IllegalArgumentException("array index must be a number: [$num]")
+                    require(idx >= 0) { "array index must be >= 0: [$num]" }
+                    tokens += PathToken.Index(idx)
+                    i = close + 1
+                }
+                else -> {
+                    val start = i
+                    while (i < s.length && s[i] != '.' && s[i] != '[') i++
+                    val name = s.substring(start, i).trim()
+                    require(name.isNotEmpty()) { "empty name in path: $path" }
+                    tokens += PathToken.Name(name)
+                }
+            }
+        }
+        require(tokens.isNotEmpty()) { "empty path" }
+        require(tokens.first() is PathToken.Name) { "path must start with a name, not an index" }
+        return tokens
+    }
+
+    /** Exactly one value kind must be present. */
+    fun parseSpec(spec: Map<String, Any?>): ValueSpec {
+        val kinds = mutableListOf<ValueSpec>()
+        if (spec["null"] == true) kinds += ValueSpec.Null
+        spec["string"]?.let { kinds += ValueSpec.Str(it.toString()) }
+        spec["enum"]?.let { kinds += ValueSpec.EnumConst(it.toString()) }
+        spec["objectId"]?.let { kinds += ValueSpec.ObjId(it.toString().trim().toLong()) }
+        for (kind in PRIMITIVES) spec[kind]?.let { kinds += ValueSpec.Prim(kind, it.toString()) }
+        if (kinds.isEmpty()) {
+            throw IllegalArgumentException("no value kind. Use null, string, enum, or one of $PRIMITIVES")
+        }
+        if (kinds.size > 1) throw IllegalArgumentException("give exactly one value kind, got ${kinds.size}")
+        return kinds.first()
+    }
+
+    fun toBoolean(raw: String): Boolean = when (raw.trim().lowercase()) {
+        "true" -> true
+        "false" -> false
+        else -> throw IllegalArgumentException("boolean must be true or false: $raw")
+    }
+
+    /** A single character, or an integer code point for it. */
+    fun toChar(raw: String): Char = when {
+        raw.length == 1 -> raw[0]
+        else -> {
+            val code = raw.trim().toIntOrNull()
+                ?: throw IllegalArgumentException("char must be one character or a number: $raw")
+            require(code in 0..0xFFFF) { "char code out of range: $code" }
+            code.toChar()
+        }
+    }
+
+    fun toInt(raw: String): Int = raw.trim().toInt()
+    fun toLong(raw: String): Long = raw.trim().toLong()
+    fun toShort(raw: String): Short = raw.trim().toShort()
+    fun toByte(raw: String): Byte = raw.trim().toByte()
+    fun toDouble(raw: String): Double = raw.trim().toDouble()
+    fun toFloat(raw: String): Float = raw.trim().toFloat()
+}

@@ -705,6 +705,21 @@ private object BridgeServer {
                     }
                 }
                 "SNAPSHOT" -> return snapshot(session, snapshotOptions(json), allowCalls)
+                "SET_VALUE" -> {
+                    val sets = parseSets(json)
+                    val results = JavaDebug.setValues(session, json.str("thread"), json.int("frameIndex") ?: 0, sets)
+                        ?: throw ApiException(409, "not a Java debug session")
+                    extra["sets"] = results.map { setDto(it) }
+                    if (json.bool("resume")) {
+                        if (session.isSuspended) {
+                            edt { session.resume() }
+                            extra["resumed"] = true
+                        } else {
+                            val resumed = JavaDebug.resumeThreads(session)
+                            if (!resumed.isNullOrEmpty()) extra["resumed"] = resumed
+                        }
+                    }
+                }
                 else -> throw ApiException(400, "unsupported action: $action")
             }
         }
@@ -761,6 +776,55 @@ private object BridgeServer {
         thread = json.str("thread"),
         toStringCalls = json.bool("toString"),
     ).clamp()
+
+    // One or more (path, value-spec) pairs from a SET_VALUE body: either sets=[...] or a single path/value.
+    private fun parseSets(json: JsonObject): List<Pair<String, Map<String, Any?>>> {
+        val out = mutableListOf<Pair<String, Map<String, Any?>>>()
+        if (json.has("sets")) {
+            val arr = json.get("sets").takeIf { it.isJsonArray }?.asJsonArray
+                ?: throw ApiException(400, "sets must be an array")
+            for (el in arr) {
+                val o = el.takeIf { it.isJsonObject }?.asJsonObject ?: throw ApiException(400, "each set must be an object")
+                val path = o.str("path") ?: throw ApiException(400, "each set needs a path")
+                val value = o.get("value")?.takeIf { it.isJsonObject }?.asJsonObject
+                    ?: throw ApiException(400, "each set needs a value object")
+                out += path to specMap(value)
+            }
+        } else {
+            val path = json.str("path") ?: throw ApiException(400, "path is required")
+            val value = json.get("value")?.takeIf { it?.isJsonObject == true }?.asJsonObject
+                ?: throw ApiException(400, "value is required, e.g. {\"int\": 5}")
+            out += path to specMap(value)
+        }
+        if (out.isEmpty()) throw ApiException(400, "no values to set")
+        return out
+    }
+
+    private fun specMap(value: JsonObject): Map<String, Any?> {
+        val m = linkedMapOf<String, Any?>()
+        for ((k, v) in value.entrySet()) {
+            m[k] = when {
+                v.isJsonNull -> null
+                v.isJsonPrimitive && v.asJsonPrimitive.isBoolean -> v.asBoolean
+                else -> v.asString
+            }
+        }
+        return m
+    }
+
+    private fun setDto(r: JavaDebug.SetResult): Map<String, Any?> {
+        val base = r.path.substringAfterLast('.').substringBefore('[')
+        val m = linkedMapOf<String, Any?>(
+            "path" to r.path,
+            "thread" to r.thread,
+            "frameIndex" to r.frameIndex,
+            "type" to r.type,
+            "old" to mask(base, r.old),
+            "new" to mask(base, r.new),
+        )
+        if (r.warning != null) m["warning"] = r.warning
+        return m
+    }
 
     // Everything the IDE debugger shows for one suspended thread, read from JDI mirrors. Read-only.
     private fun snapshot(session: XDebugSession, opts: SnapshotOptions, allowCalls: Boolean): Map<String, Any?> {
@@ -1514,6 +1578,242 @@ private object JavaDebug {
         val process = process(session) ?: return false
         onManager(process) { call(call(process, "getVirtualMachineProxy")!!, "resume") }
         return true
+    }
+
+    // Where one path segment lives, so we can read the slot and, at the last segment, write it.
+    private class Slot(
+        val read: () -> com.sun.jdi.Value?,
+        val write: (com.sun.jdi.Value?) -> Unit,
+        val declaredType: String?,
+        val finalField: Boolean = false,
+    )
+
+    class SetResult(
+        val path: String,
+        val thread: String,
+        val frameIndex: Int,
+        val type: String?,
+        val old: String?,
+        val new: String?,
+        val warning: String?,
+    )
+
+    /**
+     * Writes values into a suspended frame with JDI. Primitives, String and null need no method call, so it is safe in a
+     * suspend=thread stop. Returns null when the session is not a Java session. Each set resolves its own fresh frame.
+     */
+    fun setValues(
+        session: XDebugSession,
+        wanted: String?,
+        frameIndex: Int,
+        sets: List<Pair<String, Map<String, Any?>>>,
+    ): List<SetResult>? {
+        val process = process(session) ?: return null
+        return onManager(process, 15_000L) {
+            val thread = suspendedThreadRef(process, wanted)
+            if (!thread.isSuspended) throw ApiException(409, "thread ${thread.name()} is running")
+            val count = thread.frameCount()
+            if (frameIndex < 0 || frameIndex >= count) {
+                throw ApiException(409, "frame $frameIndex not available (frames=$count)")
+            }
+            val vm = thread.virtualMachine()
+            sets.map { (path, spec) ->
+                // Re-fetch the frame for each set: a previous setValue can invalidate the old StackFrame mirror.
+                val frame = thread.frame(frameIndex)
+                applySet(vm, frame, thread.name(), frameIndex, path, spec)
+            }
+        }
+    }
+
+    private fun applySet(
+        vm: com.sun.jdi.VirtualMachine,
+        frame: com.sun.jdi.StackFrame,
+        threadName: String,
+        frameIndex: Int,
+        path: String,
+        spec: Map<String, Any?>,
+    ): SetResult {
+        val tokens = try {
+            SetValue.parsePath(path)
+        } catch (e: IllegalArgumentException) {
+            throw ApiException(400, e.message ?: "bad path: $path")
+        }
+        val valueSpec = try {
+            SetValue.parseSpec(spec)
+        } catch (e: IllegalArgumentException) {
+            throw ApiException(400, e.message ?: "bad value")
+        }
+        val (rootSlot, consumed) = rootSlot(vm, frame, tokens)
+        var slot = rootSlot
+        for (i in consumed until tokens.size) {
+            val parent = slot.read()
+            slot = childSlot(parent, tokens[i])
+        }
+        val oldValue = try {
+            slot.read()
+        } catch (e: Exception) {
+            throw ApiException(409, "could not read ${path}: ${e.message ?: e.javaClass.simpleName}")
+        }
+        val newValue = toMirror(vm, valueSpec, slot.declaredType)
+        try {
+            slot.write(newValue)
+        } catch (e: com.sun.jdi.InvalidTypeException) {
+            throw ApiException(400, "type mismatch for $path (${slot.declaredType}): ${e.message}")
+        } catch (e: ClassCastException) {
+            throw ApiException(400, "type mismatch for $path (${slot.declaredType}): ${e.message}")
+        } catch (e: IllegalArgumentException) {
+            throw ApiException(400, "cannot set $path: ${e.message}")
+        }
+        val after = try {
+            slot.read()
+        } catch (_: Exception) {
+            newValue
+        }
+        val warning = if (slot.finalField) {
+            "the field is final. JDI may set it, but code that cached the value will not see the change"
+        } else {
+            null
+        }
+        return SetResult(path, threadName, frameIndex, slot.declaredType, render(oldValue), render(after), warning)
+    }
+
+    private fun rootSlot(
+        vm: com.sun.jdi.VirtualMachine,
+        frame: com.sun.jdi.StackFrame,
+        tokens: List<PathToken>,
+    ): Pair<Slot, Int> {
+        val name = (tokens.first() as PathToken.Name).name
+        if (name == "this") {
+            val self = safe { frame.thisObject() }
+                ?: throw ApiException(409, "no this in this frame (a static method?)")
+            if (tokens.size == 1) throw ApiException(400, "cannot assign to this")
+            return Slot({ self }, { throw ApiException(400, "cannot assign to this") }, self.referenceType().name()) to 1
+        }
+        val local = safe { frame.visibleVariables() }?.firstOrNull { it.name() == name }
+        if (local != null) {
+            return Slot(
+                { frame.getValue(local) },
+                { frame.setValue(local, it) },
+                local.typeName(),
+            ) to 1
+        }
+        val self = safe { frame.thisObject() }
+        if (self != null) {
+            val field = self.referenceType().fieldByName(name)
+            if (field != null) {
+                return if (field.isStatic) {
+                    staticSlot(self.referenceType(), field) to 1
+                } else {
+                    Slot({ self.getValue(field) }, { self.setValue(field, it) }, field.typeName(), field.isFinal) to 1
+                }
+            }
+        }
+        // A fully-qualified static field, e.g. com.example.Foo.FIELD. Greedily match the longest class name.
+        val names = tokens.takeWhile { it is PathToken.Name }.map { (it as PathToken.Name).name }
+        for (len in (names.size - 1) downTo 1) {
+            val className = names.subList(0, len).joinToString(".")
+            val type = vm.classesByName(className).firstOrNull() ?: continue
+            val field = type.fieldByName(names[len])
+                ?: throw ApiException(404, "no field ${names[len]} on $className")
+            if (!field.isStatic) throw ApiException(400, "${names[len]} on $className is not static")
+            return staticSlot(type, field) to (len + 1)
+        }
+        throw ApiException(404, "no local, field of this, or static named '$name' in this frame")
+    }
+
+    private fun staticSlot(type: com.sun.jdi.ReferenceType, field: com.sun.jdi.Field): Slot {
+        val classType = type as? com.sun.jdi.ClassType
+        return Slot(
+            { type.getValue(field) },
+            {
+                (classType ?: throw ApiException(400, "cannot set static on ${type.name()}")).setValue(field, it)
+            },
+            field.typeName(),
+            field.isFinal,
+        )
+    }
+
+    private fun childSlot(parent: com.sun.jdi.Value?, token: PathToken): Slot = when (token) {
+        is PathToken.Index -> {
+            val arr = parent as? com.sun.jdi.ArrayReference
+                ?: throw ApiException(400, "cannot index into ${typeName(parent)}; not an array")
+            val idx = token.index
+            if (idx >= arr.length()) throw ApiException(400, "index $idx out of bounds (length ${arr.length()})")
+            val component = (arr.referenceType() as? com.sun.jdi.ArrayType)?.componentTypeName()
+            Slot({ arr.getValue(idx) }, { arr.setValue(idx, it) }, component)
+        }
+        is PathToken.Name -> {
+            val obj = parent as? com.sun.jdi.ObjectReference
+                ?: throw ApiException(400, "cannot read field '${token.name}' of ${typeName(parent)}; not an object")
+            val field = obj.referenceType().fieldByName(token.name)
+                ?: throw ApiException(404, "no field '${token.name}' on ${obj.referenceType().name()}")
+            Slot({ obj.getValue(field) }, { obj.setValue(field, it) }, field.typeName(), field.isFinal)
+        }
+    }
+
+    private fun toMirror(vm: com.sun.jdi.VirtualMachine, spec: ValueSpec, declaredType: String?): com.sun.jdi.Value? {
+        try {
+            return when (spec) {
+                is ValueSpec.Null -> null
+                is ValueSpec.Str -> vm.mirrorOf(spec.value)
+                is ValueSpec.ObjId -> throw ApiException(400, "assigning an existing object by id is not supported")
+                is ValueSpec.EnumConst -> resolveEnum(vm, declaredType, spec.name)
+                is ValueSpec.Prim -> when (spec.kind) {
+                    "int" -> vm.mirrorOf(SetValue.toInt(spec.raw))
+                    "long" -> vm.mirrorOf(SetValue.toLong(spec.raw))
+                    "short" -> vm.mirrorOf(SetValue.toShort(spec.raw))
+                    "byte" -> vm.mirrorOf(SetValue.toByte(spec.raw))
+                    "double" -> vm.mirrorOf(SetValue.toDouble(spec.raw))
+                    "float" -> vm.mirrorOf(SetValue.toFloat(spec.raw))
+                    "boolean" -> vm.mirrorOf(SetValue.toBoolean(spec.raw))
+                    "char" -> vm.mirrorOf(SetValue.toChar(spec.raw))
+                    else -> throw ApiException(400, "unknown primitive kind ${spec.kind}")
+                }
+            }
+        } catch (e: NumberFormatException) {
+            throw ApiException(400, "bad number for ${(spec as? ValueSpec.Prim)?.kind}: ${e.message}")
+        } catch (e: IllegalArgumentException) {
+            throw ApiException(400, e.message ?: "bad value")
+        }
+    }
+
+    private fun resolveEnum(vm: com.sun.jdi.VirtualMachine, declaredType: String?, name: String): com.sun.jdi.Value {
+        val typeName = declaredType ?: throw ApiException(400, "enum needs a known field type")
+        val type = vm.classesByName(typeName).firstOrNull()
+            ?: throw ApiException(404, "enum type $typeName is not loaded")
+        val field = type.fieldByName(name)
+            ?: throw ApiException(404, "no enum constant $name on $typeName")
+        if (!field.isStatic) throw ApiException(400, "$name on $typeName is not an enum constant")
+        return type.getValue(field) ?: throw ApiException(404, "enum constant $name is null on $typeName")
+    }
+
+    private fun typeName(value: com.sun.jdi.Value?): String = when (value) {
+        null -> "null"
+        is com.sun.jdi.ObjectReference -> value.referenceType().name()
+        else -> value.type().name()
+    }
+
+    private fun render(value: com.sun.jdi.Value?): String? = when (value) {
+        null -> "null"
+        is com.sun.jdi.StringReference -> value.value()
+        is com.sun.jdi.ObjectReference -> "${value.referenceType().name()}@${value.uniqueID()}"
+        is com.sun.jdi.CharValue -> "'${value.value()}'"
+        else -> safe { value.toString() } ?: value.type().name()
+    }
+
+    /** A suspended thread: the event thread of a suspend context, the named thread, or main. Mirrors snapshot. */
+    private fun suspendedThreadRef(process: Any, wanted: String?): com.sun.jdi.ThreadReference {
+        val ctxs = contexts(process)
+        val withThread = ctxs.mapNotNull { c ->
+            (call(c, "getEventThread") ?: call(c, "getThread"))?.let { c to it }
+        }
+        val match = withThread.firstOrNull { (_, proxy) -> wanted == null || call(proxy, "name") == wanted }
+        if (match != null) {
+            return call(match.second, "getThreadReference") as com.sun.jdi.ThreadReference
+        }
+        val vm = call(call(process, "getVirtualMachineProxy")!!, "getVirtualMachine") as com.sun.jdi.VirtualMachine
+        return vm.allThreads().firstOrNull { it.name() == (wanted ?: "main") && it.isSuspended }
+            ?: throw ApiException(409, "no suspended thread${wanted?.let { " named $it" } ?: ""}")
     }
 
     private fun process(session: XDebugSession): Any? = try {

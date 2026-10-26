@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "dev.asdbg"
-version = "0.1.5"
+version = "0.1.6"
 
 repositories {
     mavenCentral()
@@ -37,7 +37,7 @@ intellijPlatform {
     pluginConfiguration {
         id = "dev.asdbg.bridge"
         name = "Android Debug Bridge"
-        version = "0.1.5"
+        version = "0.1.6"
         ideaVersion {
             sinceBuild = "262.9437"
             untilBuild = "262.*"
