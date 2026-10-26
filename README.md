@@ -27,6 +27,87 @@ python3 cli/asdbg.py control STEP_OVER
 python3 cli/asdbg.py control RESUME
 ```
 
+### ブレークポイントが効いているか
+
+`bp-list` と `bp-add` の各ブレークポイントに `verified` が付く。
+
+- `verified`: 動いているセッションでクラスに入った。Android Studio の赤丸にチェックが付いた状態。
+- `pending`: セッションはあるが、まだクラスが読み込まれていない。そのコードを通る前はこうなる。
+- `invalid`: 置けなかった。`verifyError` に Android Studio の理由が入る（行にコードが無いなど）。
+- `unknown`: デバッグセッションが無い、または状態が読めなかった。
+
+`verifySession` は判定に使ったセッション名。`sessions` にはセッションごとの `muted` と、プロジェクトがインデックス中かを示す `projectIndexing` が出る。
+
+### ミュート
+
+```
+python3 cli/asdbg.py mute on
+python3 cli/asdbg.py mute off --session <id>
+```
+
+Debug ウィンドウの Mute Breakpoints と同じ。ミュートはセッションごとなので、`--session` が無ければ全セッションに掛ける。ミュート中はブレークポイントが `verified` でも止まらない。
+
+### attach の前に Android Studio の準備を待つ
+
+Android Studio の起動直後はプロジェクトが読み込み途中だったり、インデックス中（dumb mode）だったりする。この間に attach すると、ブレークポイントが効かないことがある。
+
+- `attach` は、プロジェクトが読み込み途中かインデックス中なら `warnings` を返す。CLI は標準エラーに出す。
+- `attach --wait-ready` はインデックスが終わるまで待ってから attach する。待てるのは `--timeout` から 1000 ms 引いた分まで。待った時間は `waitedReadyMs` に出る。
+
+### 操作の一覧
+
+```
+python3 cli/asdbg.py threads --frames 5
+python3 cli/asdbg.py thread-suspend "Binder:1234_2"
+python3 cli/asdbg.py thread-resume "Binder:1234_2"
+python3 cli/asdbg.py step over --thread main
+python3 cli/asdbg.py run-to app/src/main/java/com/example/Main.kt 60
+python3 cli/asdbg.py frame 2 --thread main
+python3 cli/asdbg.py bp-update <id> --condition "count > 3" --pass-count 2 --suspend thread
+python3 cli/asdbg.py bp-update <id> --log-expression "amount" --suspend none
+python3 cli/asdbg.py bp-disable <id>
+python3 cli/asdbg.py detach
+```
+
+- `threads` は VM の全スレッドを返す。`status`（RUNNING、WAIT、MONITOR など）、`suspended`、`suspendCount`、ブレークポイントで止まったスレッドなら `stoppedHere: true`。`--frames N` で止まっているスレッドの上位 N フレームが付く。
+- `step` に `--thread` を付けると、そのスレッドでステップする。suspend=thread で止まったときも使える。
+- `run-to` は Run to Cursor と同じ。行は 1 から。`--ignore-breakpoints` で途中のブレークポイントを無視する。
+- `frame` は Frames で別のフレーム（やスレッド）を選ぶのと同じ。そのあとの `stack`、`vars`、`eval` はそのフレームを使う。
+- `bp-update` は手で置いたブレークポイントも変えられる。指定した項目だけ変わる。`--condition ""` と `--log-expression ""` で消える。`--pass-count 0` でパスカウントを外す。削除（`bp-rm`）はこれまでどおりこのブリッジが置いたものだけ。
+- `detach` はアプリを動かしたままデバッガを外す。`control STOP` はセッションを止める。attach したプロセスでは Android Studio の動きに従う。
+- `eval` は結果に `warning` を付け、CLI は標準エラーに出す。式はアプリで動く。suspend=thread で止めたときは他のスレッドが動いているので、止めたスレッドが持つロックを式が待つと戻らなくなる。
+
+Debug ウィンドウの操作との対応:
+
+| 操作 | 状態 | CLI |
+|---|---|---|
+| 行・メソッド・フィールドのブレークポイント | 既存 | `bp-add` |
+| 例外ブレークポイント | 既存 | `bp-add --type exception --class ...` |
+| ブレークポイント一覧 | 既存。0.1.5 で `verified` を追加 | `bp-list` |
+| 有効・無効 | 追加 | `bp-enable`、`bp-disable`、`bp-update --enable/--disable` |
+| 条件、ログ、ログ式、スタックのログ、suspend policy | 追加（既存ブレークポイントへの変更） | `bp-update` |
+| パスカウント（Pass count） | 追加。Java のブレークポイントだけ | `bp-update --pass-count` |
+| 削除、全削除 | 既存。削除はこのブリッジが置いたものだけ | `bp-rm`、`bp-clear` |
+| Mute Breakpoints | 追加 | `mute on/off` |
+| 全体の Pause、Resume | 既存 | `control PAUSE`、`control RESUME` |
+| VM ごと再開 | 既存 | `control RESUME_VM` |
+| スレッド一覧（状態とフレーム） | 追加 | `threads` |
+| スレッド単位の Suspend、Resume | 追加 | `thread-suspend`、`thread-resume` |
+| Step Over、Into、Out | 既存。0.1.5 でスレッド指定を追加 | `step`、`control STEP_*` |
+| Run to Cursor | 追加 | `run-to` |
+| フレームの選択 | 追加 | `frame` |
+| スタック、変数 | 既存 | `stack`、`vars`、`snapshot` |
+| 式の評価 | 既存。`--allow` が要る。0.1.5 で警告を追加 | `eval` |
+| 停止時の情報をまとめて取る | 追加 | `snapshot`、`control WAIT_FOR_PAUSE --snapshot` |
+| Stop と Detach | Stop は既存、Detach は追加 | `control STOP`、`detach` |
+| attach 前の準備待ち | 追加 | `attach --wait-ready` |
+| 値の書き換え（Set Value） | 未実装。次の段階。下の設計メモ | |
+| Drop Frame（フレームを戻す） | 未実装。API（`createPopFrameCommand`）はある。戻した分の副作用は戻らないので、要るときに足す | |
+| Force Return、Throw Exception | 未実装。JDI の `forceEarlyReturn` は Android の ART で使えないことがある | |
+| Watches | 作らない。Android Studio の画面の状態で、CLI では `eval` を毎回呼べば同じ | |
+| HotSwap（Apply Changes） | 対象外。ビルドと配備の操作で、デバッガの API ではない | |
+| Mark Object、Memory View | 未実装。調査で要るなら足す | |
+
 ### suspend=thread で止めたとき
 
 `--suspend thread` のブレークポイントで止まると、Android Studio のセッションは suspended にならないことがある。
@@ -36,7 +117,7 @@ python3 cli/asdbg.py control RESUME
 - `control RESUME_VM` は VM ごと再開する。RESUME で戻らないときの最後の手段。Android Studio の表示が止まったままになることがある。
 - `control WAIT_FOR_PAUSE` はスレッド単位の停止も `paused` で返す。そのときは `threadLevel: true` と `suspendedThreads` が付く。
 - `control STOP` は止める前のセッション id を返す。
-- `stack`、`vars`、`eval` は、これまでどおりセッションが suspended のときだけ使える。
+- `stack`、`vars`、`eval` は、これまでどおりセッションが suspended のときだけ使える。スレッド単位の停止では `snapshot --thread`、`threads --frames`、`step --thread` を使う。
 
 ### timeout の単位
 
@@ -99,7 +180,10 @@ Cursor の MCP 設定に次を足す。
 python3 /Users/shinma.takahashi/Develop/selfregi/android-debug-bridge/mcp-adapter/server.py
 ```
 
-ツール: `bp_add`、`bp_list`、`bp_remove`、`bp_clear`、`attach`、`start`、`sessions`、`control`、`snapshot`、`stack`、`variables`、`evaluate`。
+ツール: `bp_add`、`bp_list`、`bp_update`、`bp_remove`、`bp_clear`、`attach`、`start`、`sessions`、`mute`、`control`、`threads`、`snapshot`、`stack`、`variables`、`evaluate`。
+
+- `control` の action は CLI と同じ。`SUSPEND_THREAD`、`RESUME_THREAD`、`STEP_*` は `thread`、`RUN_TO_LINE` は `file` と `line`、`SELECT_FRAME` は `frameIndex` と `thread` を取る。`DETACH` も使える。
+- `attach` は `waitReady: true` で準備を待つ。
 
 - `snapshot` は CLI の `snapshot` と同じ。引数は `frameIndex`、`depth`、`maxChildren`、`maxString`、`maxNodes`、`thread`、`snapshotTimeout`、`toString`。
 - `control` に `action: "WAIT_FOR_PAUSE"` と `snapshot: true` を渡すと、止まったときに `snapshot` が付く。読めなかったときは `snapshotError` が付く。
