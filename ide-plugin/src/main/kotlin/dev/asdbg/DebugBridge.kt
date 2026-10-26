@@ -48,6 +48,8 @@ import com.android.tools.idea.execution.common.debug.DebugSessionStarter
 import com.android.tools.idea.execution.common.debug.impl.java.AndroidJavaDebugger
 import com.intellij.xdebugger.frame.presentation.XValuePresentation
 import com.sun.net.httpserver.HttpExchange
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import com.sun.net.httpserver.HttpServer
