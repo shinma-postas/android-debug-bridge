@@ -124,7 +124,7 @@ TOOLS = [
     },
     {
         "name": "control",
-        "description": "PAUSE, RESUME, RESUME_VM, STEP_OVER, STEP_INTO, STEP_OUT, STOP, DETACH, WAIT_FOR_PAUSE, SNAPSHOT, SUSPEND_THREAD, RESUME_THREAD, RUN_TO_LINE, or SELECT_FRAME. RESUME also resumes suspend=thread stops. RESUME_VM resumes the whole VM as a last resort. DETACH leaves the app running. STEP_* take an optional thread. SUSPEND_THREAD and RESUME_THREAD need thread. RUN_TO_LINE needs file and line (1-based). SELECT_FRAME takes frameIndex and an optional thread; stack, variables and evaluate then use that frame. WAIT_FOR_PAUSE with snapshot=true adds the snapshot tool's result when it stops.",
+        "description": "PAUSE, RESUME, RESUME_VM, STEP_OVER, STEP_INTO, STEP_OUT, STOP, DETACH, WAIT_FOR_PAUSE, SNAPSHOT, SUSPEND_THREAD, RESUME_THREAD, RUN_TO_LINE, SELECT_FRAME, or SET_VALUE (prefer the set_value tool). RESUME also resumes suspend=thread stops. RESUME_VM resumes the whole VM as a last resort. DETACH leaves the app running. STEP_* take an optional thread. SUSPEND_THREAD and RESUME_THREAD need thread. RUN_TO_LINE needs file and line (1-based). SELECT_FRAME takes frameIndex and an optional thread; stack, variables and evaluate then use that frame. WAIT_FOR_PAUSE with snapshot=true adds the snapshot tool's result when it stops.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -185,6 +185,41 @@ TOOLS = [
                 "projectPath": {"type": "string"},
             },
             "required": ["expression"],
+        },
+    },
+    {
+        "name": "set_value",
+        "description": (
+            "Write a value into a stopped frame while the debuggee is suspended, then optionally resume. "
+            "Primitives, String, null and enum constants need no method call, so this works on suspend=thread stops. "
+            "path targets a local variable, a field of this, a nested path through fields and array elements "
+            "(responsePay.result.code, arr[2]), or a fully-qualified static field (com.pkg.Foo.FIELD). "
+            "value is one kind: {int|long|short|byte|double|float: \"5\"}, {boolean: true}, {char: \"A\"}, "
+            "{string: \"hi\"}, {null: true} (object refs only), or {enum: \"PAID\"}. Assigning an object by id is not supported. "
+            "Give either one path+value, or a sets array of {path, value}. resume=true resumes after setting. "
+            "RISK: this changes state in a live payment flow and values can be sensitive; only set what you mean to. "
+            "The reply returns the old and new value (secret-like names masked) and a warning for final fields."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "single target; omit when using sets"},
+                "value": {"type": "object", "description": "single value spec; omit when using sets"},
+                "sets": {
+                    "type": "array",
+                    "description": "batch: [{path, value}] applied in order",
+                    "items": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}, "value": {"type": "object"}},
+                        "required": ["path", "value"],
+                    },
+                },
+                "frameIndex": {"type": "integer", "description": "frame index. 0 is the current frame"},
+                "thread": {"type": "string", "description": "thread name. default: the stopped thread"},
+                "resume": {"type": "boolean", "description": "resume right after setting"},
+                "sessionId": {"type": "string"},
+                "projectPath": {"type": "string"},
+            },
         },
     },
 ]
@@ -352,6 +387,21 @@ def call_tool(name, args):
         return bridge("POST", f"/v1/sessions/{session_id(args)}/evaluate", {
             "expression": args["expression"],
         }, project, allow_eval=True)
+    if name == "set_value":
+        body = {"action": "SET_VALUE"}
+        if args.get("sets") is not None:
+            body["sets"] = args["sets"]
+        if args.get("path") is not None:
+            body["path"] = args["path"]
+        if args.get("value") is not None:
+            body["value"] = args["value"]
+        if args.get("frameIndex") is not None:
+            body["frameIndex"] = args["frameIndex"]
+        if args.get("thread"):
+            body["thread"] = args["thread"]
+        if args.get("resume"):
+            body["resume"] = True
+        return bridge("POST", f"/v1/sessions/{session_id(args)}/control", body, project, timeout=30)
     return json.dumps({"error": f"unknown tool {name}"}), True
 
 
@@ -368,7 +418,7 @@ def handle(message):
             "result": {
                 "protocolVersion": requested,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "android-studio-debug", "version": "0.1.5"},
+                "serverInfo": {"name": "android-studio-debug", "version": "0.1.6"},
             },
         }
     if method == "tools/list":
@@ -394,7 +444,7 @@ def self_check():
     parsed = json.loads(line)
     assert parsed["method"] == "tools/list"
     names = [tool["name"] for tool in TOOLS]
-    for tool in ("snapshot", "mute", "threads", "bp_update"):
+    for tool in ("snapshot", "mute", "threads", "bp_update", "set_value"):
         assert tool in names, tool
     assert snapshot_body({"depth": 3, "sessionId": "x", "toString": None}) == {"depth": 3}
     print("ok")

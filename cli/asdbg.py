@@ -16,8 +16,9 @@ ENDPOINT = HOME / "endpoint.json"
 ACTIONS = (
     "PAUSE", "RESUME", "RESUME_VM", "STEP_OVER", "STEP_INTO", "STEP_OUT", "STOP",
     "WAIT_FOR_PAUSE", "SNAPSHOT", "MUTE", "UNMUTE",
-    "SUSPEND_THREAD", "RESUME_THREAD", "RUN_TO_LINE", "SELECT_FRAME", "DETACH",
+    "SUSPEND_THREAD", "RESUME_THREAD", "RUN_TO_LINE", "SELECT_FRAME", "DETACH", "SET_VALUE",
 )
+VALUE_KINDS = ("int", "long", "short", "byte", "double", "float", "boolean", "char", "string", "enum", "object-id")
 
 
 def endpoint():
@@ -82,7 +83,7 @@ def only_session(explicit):
 def cmd_tools(_):
     print("\n".join([
         "bp-add", "bp-list", "bp-update", "bp-enable", "bp-disable", "bp-rm", "bp-clear", "attach", "attach-wait", "restoration-debug", "start", "sessions", "mute", "control", "snapshot", "threads", "thread-suspend", "thread-resume",
-        "step", "run-to", "frame", "detach", "stack", "vars", "eval",
+        "step", "run-to", "frame", "detach", "set", "resume-with", "stack", "vars", "eval",
     ]))
 
 
@@ -430,6 +431,79 @@ def cmd_detach(args):
     print(json.dumps(control_call(session, {"action": "DETACH"}), indent=2))
 
 
+def value_spec_from_args(args):
+    """Exactly one of the value flags, as the JSON the bridge expects."""
+    chosen = []
+    for flag in ("int", "long", "short", "byte", "double", "float", "char", "string", "enum"):
+        value = getattr(args, flag.replace("-", "_"))
+        if value is not None:
+            chosen.append((flag, value))
+    if args.boolean is not None:
+        chosen.append(("boolean", args.boolean == "true"))
+    if args.set_null:
+        chosen.append(("null", True))
+    if args.object_id is not None:
+        chosen.append(("objectId", args.object_id))
+    if not chosen:
+        sys.exit("give one value: --int, --string, --boolean, --null, --enum, etc.")
+    if len(chosen) > 1:
+        sys.exit("give exactly one value kind, got: " + ", ".join(k for k, _ in chosen))
+    key, value = chosen[0]
+    return {key: value}
+
+
+def cmd_set(args):
+    session = only_session(args.session)
+    body = {"action": "SET_VALUE", "path": args.path, "value": value_spec_from_args(args)}
+    if args.frame:
+        body["frameIndex"] = args.frame
+    if args.thread:
+        body["thread"] = args.thread
+    if args.resume:
+        body["resume"] = True
+    result = control_call(session, body, timeout=30)
+    for item in result.get("sets", []):
+        if item.get("warning"):
+            print("warning: " + item["warning"], file=sys.stderr)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def cmd_resume_with(args):
+    session = only_session(args.session)
+    if args.file:
+        raw = Path(args.file).read_text()
+    elif args.json:
+        raw = args.json
+    else:
+        raw = sys.stdin.read()
+    sets = json.loads(raw)
+    if isinstance(sets, dict):
+        sets = sets.get("sets", [sets])
+    if not isinstance(sets, list) or not sets:
+        sys.exit("expected a JSON array of {path, value} objects")
+    body = {"action": "SET_VALUE", "sets": sets, "resume": not args.no_resume}
+    if args.frame:
+        body["frameIndex"] = args.frame
+    if args.thread:
+        body["thread"] = args.thread
+    result = control_call(session, body, timeout=30)
+    for item in result.get("sets", []):
+        if item.get("warning"):
+            print("warning: " + item["warning"], file=sys.stderr)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def add_set_value_flags(parser):
+    for flag in ("int", "long", "short", "byte", "enum", "string"):
+        parser.add_argument("--" + flag)
+    for flag in ("double", "float"):
+        parser.add_argument("--" + flag)
+    parser.add_argument("--char")
+    parser.add_argument("--boolean", choices=["true", "false"])
+    parser.add_argument("--null", dest="set_null", action="store_true", help="assign null (object fields only)")
+    parser.add_argument("--object-id", dest="object_id", help="not supported yet; reserved")
+
+
 def cmd_control(args):
     check_timeout(args.timeout)
     session = only_session(args.session)
@@ -651,6 +725,31 @@ def build_parser():
         cmd.add_argument("--session")
         cmd.set_defaults(func=func)
 
+    set_cmd = sub.add_parser(
+        "set",
+        help="write a value into a stopped frame. e.g. set responsePay.result.code --int 200",
+    )
+    set_cmd.add_argument("path", help="local, this.field, nested path, arr[2], or com.pkg.Foo.FIELD")
+    add_set_value_flags(set_cmd)
+    set_cmd.add_argument("--frame", type=int, default=0, help="frame index. 0 is the current frame")
+    set_cmd.add_argument("--thread", help="thread name. default: the stopped thread")
+    set_cmd.add_argument("--resume", action="store_true", help="resume right after setting")
+    set_cmd.add_argument("--session")
+    set_cmd.set_defaults(func=cmd_set)
+
+    rw = sub.add_parser(
+        "resume-with",
+        help="set several values from JSON, then resume. JSON: [{\"path\":..,\"value\":{..}}]",
+    )
+    group = rw.add_mutually_exclusive_group()
+    group.add_argument("--file", help="path to a JSON file")
+    group.add_argument("--json", help="inline JSON")
+    rw.add_argument("--frame", type=int, default=0)
+    rw.add_argument("--thread")
+    rw.add_argument("--no-resume", action="store_true", help="only set, do not resume")
+    rw.add_argument("--session")
+    rw.set_defaults(func=cmd_resume_with)
+
     ev = sub.add_parser("eval")
     ev.add_argument("expression")
     ev.add_argument("--session")
@@ -693,6 +792,25 @@ def self_check():
     assert parser.parse_args(["frame", "2"]).index == 2
     assert parser.parse_args(["threads", "--frames", "5"]).frames == 5
     assert parser.parse_args(["control", "STEP_OVER", "--thread-name", "main"]).thread_name == "main"
+    assert parser.parse_args(["control", "SET_VALUE"]).action == "SET_VALUE"
+    args = parser.parse_args(["set", "responsePay.result.code", "--int", "200", "--frame", "1", "--resume"])
+    assert value_spec_from_args(args) == {"int": "200"} and args.frame == 1 and args.resume
+    assert value_spec_from_args(parser.parse_args(["set", "x", "--null"])) == {"null": True}
+    assert value_spec_from_args(parser.parse_args(["set", "x", "--boolean", "true"])) == {"boolean": True}
+    assert value_spec_from_args(parser.parse_args(["set", "x", "--string", "hi"])) == {"string": "hi"}
+    try:
+        value_spec_from_args(parser.parse_args(["set", "x", "--int", "1", "--long", "2"]))
+    except SystemExit as error:
+        assert "exactly one" in str(error)
+    else:
+        raise SystemExit("two value kinds should stop")
+    try:
+        value_spec_from_args(parser.parse_args(["set", "x"]))
+    except SystemExit as error:
+        assert "one value" in str(error)
+    else:
+        raise SystemExit("no value should stop")
+    assert parser.parse_args(["resume-with", "--json", "[]"]).json == "[]"
     try:
         cmd_eval(parser.parse_args(["eval", "1+1"]))
     except SystemExit as error:
