@@ -234,23 +234,23 @@ class PauseHooksTest {
     @Test
     fun classAndMethodPreferJdiLocation() {
         assertEquals(
-            "jp.co.example.SrSelfTicketActivity" to "onClick",
-            PauseMapping.classAndMethod("jp.co.example.SrSelfTicketActivity", "onClick", "other:1, X (y)"),
+            "com.example.app.MainActivity" to "onClick",
+            PauseMapping.classAndMethod("com.example.app.MainActivity", "onClick", "other:1, X (y)"),
         )
     }
 
     @Test
     fun classAndMethodFromFrameText() {
         assertEquals(
-            "jp.co.example.SrSelfTicketActivity" to "onClick",
-            PauseMapping.classAndMethod(null, null, "onClick:4627, SrSelfTicketActivity (jp.co.example)"),
+            "com.example.app.MainActivity" to "onClick",
+            PauseMapping.classAndMethod(null, null, "onClick:120, MainActivity (com.example.app)"),
         )
         assertEquals(
-            "jp.co.example.SrSelfTicketActivity\$a\$1" to "invoke",
+            "com.example.app.MainActivity\$a\$1" to "invoke",
             PauseMapping.classAndMethod(
                 null,
                 null,
-                "invoke:12, SrSelfTicketActivity\$a\$1 {jp.co.example.SrSelfTicketActivity\$a\$1} (jp.co.example)",
+                "invoke:12, MainActivity\$a\$1 {com.example.app.MainActivity\$a\$1} (com.example.app)",
             ),
         )
         assertEquals("Foo" to "<init>", PauseMapping.classAndMethod(null, null, "<init>:3, Foo"))
@@ -262,10 +262,10 @@ class PauseHooksTest {
     @Test
     fun dedupMatchesThreadWhenLinesDiffer() {
         val d = PauseDedup(1500)
-        d.markJdi("s", 4627, 0, "main")
-        assertTrue(d.seenByJdi("s", 4626, 300, "main"))
-        assertFalse(d.seenByJdi("s", 4626, 300, "worker"))
-        assertFalse(d.seenByJdi("s", 4626, 300, null))
-        assertFalse(d.seenByJdi("s", 4627, 1600, "main"))
+        d.markJdi("s", 120, 0, "main")
+        assertTrue(d.seenByJdi("s", 119, 300, "main"))
+        assertFalse(d.seenByJdi("s", 119, 300, "worker"))
+        assertFalse(d.seenByJdi("s", 119, 300, null))
+        assertFalse(d.seenByJdi("s", 120, 1600, "main"))
     }
 }

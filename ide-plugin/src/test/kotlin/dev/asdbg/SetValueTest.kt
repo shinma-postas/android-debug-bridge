@@ -15,7 +15,7 @@ class SetValueTest {
 
     @Test
     fun parsesDottedAndIndexedPaths() {
-        assertEquals(listOf("responsePay", "result", "code"), names("responsePay.result.code"))
+        assertEquals(listOf("response", "result", "code"), names("response.result.code"))
         assertEquals(listOf("arr", "[2]"), names("arr[2]"))
         assertEquals(listOf("this", "payment", "amount"), names("this.payment.amount"))
         assertEquals(listOf("grid", "[0]", "[1]", "cell"), names("grid[0][1].cell"))

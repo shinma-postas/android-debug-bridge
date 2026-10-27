@@ -241,7 +241,7 @@ private object BridgeServer {
         val path = exchange.requestURI.path
         val method = exchange.requestMethod.uppercase()
         if (method == "GET" && path == "/health") {
-            send(exchange, 200, mapOf("ok" to true))
+            send(exchange, 200, mapOf("ok" to true, "version" to ASDBG_VERSION))
             return
         }
         if (!path.startsWith("/v1/")) {
@@ -524,7 +524,7 @@ private object BridgeServer {
 
     private fun attachToProcess(project: Project, json: JsonObject): Map<String, Any?> {
         val serial = json.str("serial") ?: throw ApiException(400, "serial is required")
-        val packageName = json.str("package") ?: "jp.co.persol.postas.selfregi"
+        val packageName = json.str("package") ?: throw ApiException(400, "package is required. e.g. com.example.app")
         val timeout = json.long("timeout") ?: 60_000L
         if (timeout < 1_000L) {
             throw ApiException(400, "timeout is in milliseconds. got $timeout ms. Use 30000 for 30 seconds")

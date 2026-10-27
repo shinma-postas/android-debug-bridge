@@ -439,7 +439,7 @@ internal sealed class ValueSpec {
 internal object SetValue {
     val PRIMITIVES = setOf("int", "long", "short", "byte", "double", "float", "boolean", "char")
 
-    /** `responsePay.result.code`, `arr[2]`, `this.payment.amount`, `com.example.Foo.FIELD`. */
+    /** `response.result.code`, `arr[2]`, `this.payment.amount`, `com.example.Foo.FIELD`. */
     fun parsePath(path: String): List<PathToken> {
         val s = path.trim()
         require(s.isNotEmpty()) { "empty path" }

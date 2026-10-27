@@ -74,14 +74,14 @@ class MirrorWalkerTest {
             Triple("size", "int", int(2)),
             Triple("elementData", "java.lang.Object[]", array("java.lang.Object[]", listOf(str("A001"), str("A002"), null))),
         ))
-        val payment = obj("jp.example.Payment", listOf(
+        val payment = obj("com.example.Payment", listOf(
             Triple("amount", "int", int(1200)),
-            Triple("poichiToken", "java.lang.String", str("dummy-not-real")),
+            Triple("authToken", "java.lang.String", str("dummy-not-real")),
             Triple("items", "java.util.List", list),
         ))
         return obj("jp.example.SampleActivity", listOf(
             Triple("state", "java.lang.String", str("PAYING")),
-            Triple("payment", "jp.example.Payment", payment),
+            Triple("payment", "com.example.Payment", payment),
             Triple("note", "java.lang.String", str("x".repeat(40))),
         ))
     }

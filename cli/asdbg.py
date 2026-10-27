@@ -5,10 +5,12 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -84,7 +86,7 @@ def only_session(explicit):
 def cmd_tools(_):
     print("\n".join([
         "bp-add", "bp-list", "bp-update", "bp-enable", "bp-disable", "bp-rm", "bp-clear", "attach", "attach-wait", "restoration-debug", "start", "sessions", "mute", "control", "snapshot", "threads", "thread-suspend", "thread-resume",
-        "step", "run-to", "frame", "detach", "set", "resume-with", "stack", "vars", "eval", "webhook", "watch",
+        "step", "run-to", "frame", "detach", "set", "resume-with", "stack", "vars", "eval", "webhook", "watch", "doctor",
     ]))
 
 
@@ -154,11 +156,16 @@ def cmd_bp_clear(_):
     print(json.dumps(request("DELETE", "/v1/breakpoints"), indent=2))
 
 
+def require_package(args):
+    """The app id comes from --package or ASDBG_PACKAGE. There is no built-in default."""
+    if not args.package:
+        sys.exit(json.dumps({"error": "pass --package <applicationId> or set ASDBG_PACKAGE"}))
+    return args.package
+
+
 def cmd_attach(args):
     check_timeout(args.timeout, strict=True)
-    body = {"serial": args.serial, "timeout": args.timeout}
-    if args.package:
-        body["package"] = args.package
+    body = {"serial": args.serial, "timeout": args.timeout, "package": require_package(args)}
     if args.force:
         body["force"] = True
     if args.wait_for_process:
@@ -227,7 +234,7 @@ def do_attach(serial, package, timeout=60000, force=False, wait_for_process=Fals
 def cmd_restoration_debug(args):
     """BP1 + attach, then on app restart auto BP2 + force attach."""
     check_timeout(args.attach_timeout, strict=True)
-    package = args.package
+    package = require_package(args)
     serial = args.serial
     interval = args.interval / 1000.0
     deadline = time.time() + args.timeout / 1000.0
@@ -301,7 +308,7 @@ def cmd_restoration_debug(args):
 
 def cmd_attach_wait(args):
     check_timeout(args.timeout, strict=True)
-    package = args.package
+    package = require_package(args)
     deadline = time.time() + args.timeout / 1000.0
     if args.stop_sessions:
         stop_debug_sessions()
@@ -730,11 +737,76 @@ def cmd_watch(args):
         sys.exit(2)
 
 
+def doctor_checks(expect_version=None):
+    """Read-only setup check. Never prints the token. Does not touch breakpoints or sessions."""
+    checks = []
+
+    def add(name, ok, detail="", required=True):
+        checks.append({"check": name, "ok": bool(ok), "required": required, "detail": detail})
+        return ok
+
+    add("python>=3.8", sys.version_info >= (3, 8), sys.version.split()[0])
+    add("adb on PATH", shutil.which("adb") is not None, "needed by attach-wait and restoration-debug only", required=False)
+    if os.environ.get("ASDBG_URL") and os.environ.get("ASDBG_TOKEN"):
+        base, token = os.environ["ASDBG_URL"].rstrip("/"), os.environ["ASDBG_TOKEN"]
+        add("endpoint", True, "from ASDBG_URL and ASDBG_TOKEN")
+    else:
+        if not add("endpoint.json", ENDPOINT.exists(), str(ENDPOINT) if ENDPOINT.exists() else
+                   f"{ENDPOINT} is missing. Install the plugin and restart Android Studio"):
+            return checks
+        try:
+            data = json.loads(ENDPOINT.read_text())
+            base = data["url"].rstrip("/")
+            token_file = Path(data["tokenFile"])
+        except (OSError, ValueError, KeyError) as error:
+            add("endpoint.json readable", False, type(error).__name__)
+            return checks
+        host = urllib.parse.urlparse(base).hostname
+        add("bridge listens on localhost", host in ("127.0.0.1", "localhost"), f"host={host}")
+        if not add("token file", token_file.exists(), "present (value not shown)" if token_file.exists() else "missing"):
+            return checks
+        if os.name == "posix":
+            mode = token_file.stat().st_mode & 0o777
+            add("token file is private (600)", mode & 0o077 == 0, oct(mode), required=False)
+        token = token_file.read_text().strip()
+    try:
+        with urllib.request.urlopen(base + "/health", timeout=5) as response:
+            health = json.loads(response.read().decode() or "{}")
+        version = health.get("version", "unknown (0.1.8 or older)")
+        add("GET /health", health.get("ok") is True, f"pluginVersion={version}")
+        if expect_version:
+            add("plugin version", version == expect_version,
+                f"running {version}, expected {expect_version}. Quit Android Studio completely and start it again")
+    except (OSError, ValueError) as error:
+        add("GET /health", False, f"{type(error).__name__}. Is Android Studio running with the plugin?")
+        return checks
+    req = urllib.request.Request(base + "/v1/webhook", headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            add("token accepted", True, "GET /v1/webhook returned 200")
+    except urllib.error.HTTPError as error:
+        add("token accepted", False, f"HTTP {error.code}. Restart Android Studio so endpoint.json and token match")
+    except OSError as error:
+        add("token accepted", False, type(error).__name__)
+    return checks
+
+
+def cmd_doctor(args):
+    checks = doctor_checks(args.expect_version)
+    ok = all(item["ok"] for item in checks if item["required"])
+    print(json.dumps({"ok": ok, "home": str(HOME), "checks": checks}, indent=2, ensure_ascii=False))
+    if not ok:
+        sys.exit(1)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="asdbg")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("tools").set_defaults(func=cmd_tools)
+    doctor = sub.add_parser("doctor", help="read-only setup check. never prints the token")
+    doctor.add_argument("--expect-version", help="fail unless the running plugin has this version")
+    doctor.set_defaults(func=cmd_doctor)
     schema = sub.add_parser("schema")
     schema.add_argument("name")
     schema.set_defaults(func=cmd_schema)
@@ -773,7 +845,7 @@ def build_parser():
 
     attach = sub.add_parser("attach")
     attach.add_argument("--serial", required=True)
-    attach.add_argument("--package", default="jp.co.persol.postas.selfregi")
+    attach.add_argument("--package", default=os.environ.get("ASDBG_PACKAGE"), help="applicationId. default: $ASDBG_PACKAGE")
     attach.add_argument("--timeout", type=int, default=60000, help="milliseconds. under 1000 is rejected")
     attach.add_argument("--force", action="store_true", help="stop existing IDE debug sessions before attach")
     attach.add_argument("--wait-for-process", action="store_true", help="poll until the package process appears")
@@ -789,7 +861,7 @@ def build_parser():
         help="after app kill/restart: stop stale sessions, wait for process, force attach",
     )
     attach_wait.add_argument("--serial", required=True)
-    attach_wait.add_argument("--package", default="jp.co.persol.postas.selfregi")
+    attach_wait.add_argument("--package", default=os.environ.get("ASDBG_PACKAGE"), help="applicationId. default: $ASDBG_PACKAGE")
     attach_wait.add_argument("--timeout", type=int, default=180000)
     attach_wait.add_argument("--interval", type=int, default=500, help="poll interval ms")
     attach_wait.add_argument("--no-stop-sessions", dest="stop_sessions", action="store_false")
@@ -802,16 +874,13 @@ def build_parser():
 
     restore = sub.add_parser(
         "restoration-debug",
-        help="BP1+attach, then on process restart switch to BP2 and force attach",
+        help="two-phase restart debugging: BP1 + attach, then on process restart switch to BP2 and force attach",
     )
     restore.add_argument("--serial", required=True)
-    restore.add_argument("--package", default="jp.co.persol.postas.selfregi")
-    restore.add_argument(
-        "--file",
-        default="app/src/main/java/jp/co/persol/postas/selfregi/Activity/base/SrPaymentBase.kt",
-    )
-    restore.add_argument("--bp1-line", type=int, default=993)
-    restore.add_argument("--bp2-line", type=int, default=2986)
+    restore.add_argument("--package", default=os.environ.get("ASDBG_PACKAGE"), help="applicationId. default: $ASDBG_PACKAGE")
+    restore.add_argument("--file", required=True, help="source file relative to the project root")
+    restore.add_argument("--bp1-line", type=int, required=True, help="1-based line for the first run")
+    restore.add_argument("--bp2-line", type=int, required=True, help="1-based line after the app restarts")
     restore.add_argument("--timeout", type=int, default=3600000, help="watch timeout ms")
     restore.add_argument("--attach-timeout", type=int, default=60000)
     restore.add_argument("--interval", type=int, default=500)
@@ -891,7 +960,7 @@ def build_parser():
 
     set_cmd = sub.add_parser(
         "set",
-        help="write a value into a stopped frame. e.g. set responsePay.result.code --int 200",
+        help="write a value into a stopped frame. e.g. set response.result.code --int 200",
     )
     set_cmd.add_argument("path", help="local, this.field, nested path, arr[2], or com.pkg.Foo.FIELD")
     add_set_value_flags(set_cmd)
@@ -969,6 +1038,14 @@ def self_check():
         raise SystemExit("attach --timeout 30 should stop")
     assert check_timeout(30000, strict=True) == 30000
     assert parser.parse_args(["attach", "--serial", "X", "--wait-ready"]).wait_ready
+    try:
+        cmd_attach(parser.parse_args(["attach", "--serial", "X", "--package", ""]))
+    except SystemExit as error:
+        if "ASDBG_PACKAGE" not in str(error):
+            raise
+    else:
+        raise SystemExit("attach without a package should stop")
+    assert parser.parse_args(["doctor"]).func is cmd_doctor
     assert parser.parse_args(["mute", "off"]).state == "off"
     args = parser.parse_args(["bp-update", "abc", "--disable", "--pass-count", "3", "--suspend", "none"])
     assert args.enable is False and args.pass_count == 3 and args.suspend == "none"
@@ -981,7 +1058,7 @@ def self_check():
     assert parser.parse_args(["threads", "--frames", "5"]).frames == 5
     assert parser.parse_args(["control", "STEP_OVER", "--thread-name", "main"]).thread_name == "main"
     assert parser.parse_args(["control", "SET_VALUE"]).action == "SET_VALUE"
-    args = parser.parse_args(["set", "responsePay.result.code", "--int", "200", "--frame", "1", "--resume"])
+    args = parser.parse_args(["set", "response.result.code", "--int", "200", "--frame", "1", "--resume"])
     assert value_spec_from_args(args) == {"int": "200"} and args.frame == 1 and args.resume
     assert value_spec_from_args(parser.parse_args(["set", "x", "--null"])) == {"null": True}
     assert value_spec_from_args(parser.parse_args(["set", "x", "--boolean", "true"])) == {"boolean": True}

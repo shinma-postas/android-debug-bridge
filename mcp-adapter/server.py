@@ -90,7 +90,7 @@ TOOLS = [
     },
     {
         "name": "attach",
-        "description": "Attach the IDE debugger to an already running Android process. Does not reinstall the app. serial is the device serial. package defaults to jp.co.persol.postas.selfregi.",
+        "description": "Attach the IDE debugger to an already running Android process. Does not reinstall the app. serial is the device serial. package is the application id. Without it, the ASDBG_PACKAGE env var of this MCP server is used.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -194,11 +194,11 @@ TOOLS = [
             "Write a value into a stopped frame while the debuggee is suspended, then optionally resume. "
             "Primitives, String, null and enum constants need no method call, so this works on suspend=thread stops. "
             "path targets a local variable, a field of this, a nested path through fields and array elements "
-            "(responsePay.result.code, arr[2]), or a fully-qualified static field (com.pkg.Foo.FIELD). "
+            "(response.result.code, arr[2]), or a fully-qualified static field (com.pkg.Foo.FIELD). "
             "value is one kind: {int|long|short|byte|double|float: \"5\"}, {boolean: true}, {char: \"A\"}, "
             "{string: \"hi\"}, {null: true} (object refs only), or {enum: \"PAID\"}. Assigning an object by id is not supported. "
             "Give either one path+value, or a sets array of {path, value}. resume=true resumes after setting. "
-            "RISK: this changes state in a live payment flow and values can be sensitive; only set what you mean to. "
+            "RISK: this changes state in the live app and values can be sensitive; only set what you mean to. "
             "The reply returns the old and new value (secret-like names masked) and a warning for final fields."
         ),
         "inputSchema": {
@@ -412,8 +412,10 @@ def call_tool(name, args):
         if timeout < 1000:
             return json.dumps({"error": f"timeout is in milliseconds. got {timeout} ms. Use 30000 for 30 seconds"}), True
         body = {"serial": args["serial"], "timeout": timeout}
-        if args.get("package"):
-            body["package"] = args["package"]
+        package = args.get("package") or os.environ.get("ASDBG_PACKAGE")
+        if not package:
+            return json.dumps({"error": "package is required. pass package or set ASDBG_PACKAGE"}), True
+        body["package"] = package
         if args.get("force"):
             body["force"] = True
         if args.get("waitForProcess"):
@@ -518,7 +520,7 @@ def handle(message):
             "result": {
                 "protocolVersion": requested,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "android-studio-debug", "version": "0.1.8"},
+                "serverInfo": {"name": "android-studio-debug", "version": "0.1.9"},
             },
         }
     if method == "tools/list":

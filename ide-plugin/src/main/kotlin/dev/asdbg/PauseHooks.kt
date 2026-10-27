@@ -22,7 +22,7 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
-internal const val ASDBG_VERSION = "0.1.8"
+internal const val ASDBG_VERSION = "0.1.9"
 
 /**
  * Pause hooks config, stored in ~/.android-debug-bridge/webhook.json. Off by default.
@@ -216,8 +216,8 @@ internal object PauseMapping {
         return Policy(policy, threadLevel, ctx, bp)
     }
 
-    // IntelliJ Java frame text: "onClick:4627, SrSelfTicketActivity (jp.co.example)" or with the runtime class in braces:
-    // "invoke:12, SrSelfTicketActivity$a$1 {jp.co.example.SrSelfTicketActivity$a$1} (jp.co.example)".
+    // IntelliJ Java frame text: "onClick:120, MainActivity (com.example.app)" or with the runtime class in braces:
+    // "invoke:12, MainActivity$a$1 {com.example.app.MainActivity$a$1} (com.example.app)".
     private val frameText = Regex("""^\s*([\w$<>\-]+):\d+,\s+([\w$]+)(?:\s+\{([\w.$]+)\})?(?:\s+\(([\w.]+)\))?""")
 
     /** class and method from the JDI Location when present, else parsed from the IDE stack frame text. */
