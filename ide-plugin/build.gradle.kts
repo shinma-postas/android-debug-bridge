@@ -4,7 +4,44 @@ plugins {
 }
 
 group = "dev.asdbg"
-version = "0.1.8"
+version = "0.1.9"
+
+/**
+ * Android Studio のインストール先を決める。
+ * 1. Gradle プロパティ androidStudioPath（-PandroidStudioPath=... か ~/.gradle/gradle.properties）
+ * 2. 環境変数 ANDROID_STUDIO_PATH
+ * 3. OS ごとのよくある場所
+ * macOS は .app のパス、Linux と Windows は bin と lib があるディレクトリを指す。
+ */
+fun findAndroidStudio(): File {
+    val explicit = (findProperty("androidStudioPath") as String?)?.takeIf { it.isNotBlank() }
+        ?: System.getenv("ANDROID_STUDIO_PATH")?.takeIf { it.isNotBlank() }
+    if (explicit != null) {
+        val dir = File(explicit)
+        require(dir.isDirectory) { "androidStudioPath / ANDROID_STUDIO_PATH が見つからない: $explicit" }
+        return dir
+    }
+    val home = System.getProperty("user.home")
+    val candidates = listOf(
+        "/Applications/Android Studio.app",
+        "$home/Applications/Android Studio.app",
+        "/opt/android-studio",
+        "/usr/local/android-studio",
+        "$home/android-studio",
+        "/snap/android-studio/current/android-studio",
+        "C:\\Program Files\\Android\\Android Studio",
+        "${System.getenv("LOCALAPPDATA") ?: ""}\\Programs\\Android Studio",
+    )
+    return candidates.map(::File).firstOrNull { it.isDirectory }
+        ?: throw GradleException(
+            "Android Studio が見つからない。-PandroidStudioPath=<path> か環境変数 ANDROID_STUDIO_PATH で指定する。探した場所: $candidates",
+        )
+}
+
+val androidStudio = findAndroidStudio()
+// macOS は Contents/lib、Linux と Windows は lib。
+val studioLib = File(androidStudio, "Contents/lib").takeIf { it.isDirectory } ?: File(androidStudio, "lib")
+val gsonJar = File(studioLib, "intellij.libraries.gson.jar")
 
 repositories {
     mavenCentral()
@@ -15,12 +52,12 @@ repositories {
 
 dependencies {
     intellijPlatform {
-        local("/Applications/Android Studio.app")
+        local(androidStudio.path)
         bundledPlugin("org.jetbrains.android")
     }
-    compileOnly(files("/Applications/Android Studio.app/Contents/lib/intellij.libraries.gson.jar"))
+    compileOnly(files(gsonJar))
     testImplementation("junit:junit:4.13.2")
-    testImplementation(files("/Applications/Android Studio.app/Contents/lib/intellij.libraries.gson.jar"))
+    testImplementation(files(gsonJar))
 }
 
 tasks.test {
@@ -38,7 +75,7 @@ intellijPlatform {
     pluginConfiguration {
         id = "dev.asdbg.bridge"
         name = "Android Debug Bridge"
-        version = "0.1.8"
+        version = project.version.toString()
         ideaVersion {
             sinceBuild = "262.9437"
             untilBuild = "262.*"
