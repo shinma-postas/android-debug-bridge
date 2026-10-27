@@ -3,3 +3,17 @@ build/
 ide-plugin/.gradle/
 ide-plugin/build/
 ide-plugin/.intellijPlatform/
+local.properties
+.idea/
+*.iml
+.DS_Store
+._*
+__pycache__/
+*.pyc
+# never commit the bridge's per-machine files
+token
+endpoint.json
+webhook.json
+pause-events.jsonl*
+on-pause.log
+.android-debug-bridge/

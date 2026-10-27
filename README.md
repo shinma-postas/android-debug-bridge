@@ -1,31 +1,338 @@
-# Android Studio debug bridge
+# Android Studio debug bridge（asdbg）
 
-Android Studio 2026.2.1 の MCP Server は `http://127.0.0.1:64342/stream` で動く。ツール一覧に `xdebug_*` は無い。Debugger MCP Toolset は IntelliJ IDEA 同梱で、この Android Studio には入っていない。
+asdbg は、Android Studio が持っているデバッグセッションを、シェルや AI エージェントから操作するための道具です。Android Studio のプラグインが `127.0.0.1` に小さな HTTP API を開きます。CLI（`cli/asdbg.py`）と MCP サーバ（`mcp-adapter/server.py`）は、その API を呼びます。別の jdb は張りません。Android Studio の画面で見ているのと同じセッション、同じブレークポイントを扱います。
 
-このディレクトリのプラグインは、Android Studio が持っているデバッグセッションを `127.0.0.1` の API にする。別の jdb は張らない。
+できることの例です。
 
-## 入れる
+- ブレークポイントの追加、変更、削除（行、メソッド、フィールド、例外）
+- 動いているアプリへの attach と、Run Configuration の Debug 起動
+- 停止待ち、ステップ、Run to Cursor、スレッド単位の停止と再開
+- 止まった時点のスタックと変数をまとめて取る（snapshot）
+- 止まっている間に値を書き換える（Set Value）
+- 止まったことをファイル、HTTP、コマンドで知らせる（pause hooks）
 
+## 目次
+
+1. [前提条件](#前提条件)
+2. [エージェントに任せてセットアップする](#エージェントに任せてセットアップする)
+3. [手でセットアップする](#手でセットアップする)
+4. [動いているか確かめる](#動いているか確かめる)
+5. [主な使い方](#主な使い方)
+6. [MCP](#mcp)
+7. [エージェント用のスキル](#エージェント用のスキル)
+8. [困ったとき](#困ったとき)
+9. [セキュリティ](#セキュリティ)
+10. [開発](#開発)
+11. [詳しい仕様](#詳しい仕様)
+
+## 前提条件
+
+| 項目 | 内容 |
+|---|---|
+| OS | macOS または Linux。`scripts/setup.sh` はこの 2 つで動きます。Windows は「[Windows で入れる](#windows-で入れる)」の手順を使います。 |
+| Android Studio | 2026.2 系（ビルド番号 262.9437 以降、262.* まで）。範囲は `ide-plugin/build.gradle.kts` の `sinceBuild` と `untilBuild` で決まります。 |
+| JDK | ビルドに JDK 21 以上が要ります。Android Studio に入っている JBR を使うので、別に入れる必要はありません。 |
+| Python | 3.8 以上。CLI と MCP サーバは標準ライブラリだけで動きます。pip は使いません。 |
+| コマンド | `git`、`python3`、`unzip`。`adb` は `attach-wait` と `restoration-debug` を使うときだけ要ります。`attach` そのものは Android Studio の adb を使います。 |
+| ネットワーク | 初回のビルドで Gradle が Maven Central と JetBrains のリポジトリから依存を取ります。 |
+| リポジトリ | このリポジトリを clone できる権限が要ります。 |
+
+Android Studio が標準の場所に無いときは、環境変数 `ANDROID_STUDIO_PATH` に場所を入れます。macOS では `.app` のパス、Linux では `bin` と `lib` があるディレクトリです。
+
+## エージェントに任せてセットアップする
+
+次のコードブロックを、そのまま Cursor や Claude Code などのエージェントに貼ってください。エージェントは途中で 1 回だけ、Android Studio の再起動を頼んできます。最後に `SETUP COMPLETE` と出れば終わりです。
+
+```text
+asdbg（Android Studio debug bridge）をこのマシンにセットアップしてください。最後の確認が通るまで、次の手順を順に進めてください。
+
+守ること:
+- ~/.android-debug-bridge/token の中身は読まない、表示しない、ログやチャットに書かない。確認は scripts/setup.sh verify に任せる。
+- 既存のプラグイン、MCP 設定、スキル、~/.local/bin/asdbg は上書きしない。scripts/setup.sh が ~/.android-debug-bridge/backups/ に退避してから入れ替えるので、手で消したり上書きしたりしない。
+- 端末（adb）、デバッグセッション、ブレークポイントには触らない。
+- Android Studio の終了や起動は自分でしない。人間に頼む。
+- コマンドが失敗したら、そこで止まって出力をそのまま人間に見せ、どうするか聞く。sudo は使わない。
+
+手順:
+1. OS を `uname -s` で確かめる。Darwin か Linux なら次へ進む。それ以外（Windows など）なら、README の「Windows で入れる」の手順を人間と一緒に進め、この手順はそこで終える。
+2. リポジトリを用意する。人間に置き場所の希望を聞き、無ければ "$HOME/android-debug-bridge" にする。この場所を ASDBG_DIR とする。
+   - ASDBG_DIR に既に clone があれば `git -C "$ASDBG_DIR" status --short` が空であることを確かめてから `git -C "$ASDBG_DIR" pull --ff-only` する。空でなければ止まって人間に聞く。
+   - 無ければ `git clone https://github.com/shinma-postas/android-debug-bridge.git "$ASDBG_DIR"` する。権限が無くて失敗したら、人間にアクセス権を頼む。
+   - 以降のコマンドはすべて `cd "$ASDBG_DIR"` してから実行する。
+3. `bash scripts/setup.sh check` を実行する。OS、Android Studio の場所とビルド番号、JBR、python3、plugins フォルダを自動で調べる。
+   - Android Studio が見つからないと言われたら、人間に場所を聞いて `bash scripts/setup.sh check --studio "<場所>"` で再実行する。以降のコマンドにも同じ `--studio` を付ける。
+   - バージョンが範囲外と言われたら止まって人間に伝える。
+4. `bash scripts/setup.sh build` を実行する。プラグインのビルドとテストを行う。数分かかることがある。
+5. `bash scripts/setup.sh install` を実行する。古い asdbg プラグインがあれば退避してから入れる。退避先のパスを控える。
+6. 人間に次のとおり伝えて、返事が来るまで待つ。先へ進まない。
+   「Android Studio を完全に終了してから起動し直し、デバッグしたいプロジェクトを開いてください。終わったら『再起動した』と返事してください。」
+7. `bash scripts/setup.sh cli` を実行する。~/.local/bin/asdbg ができる。PATH に無いと警告が出たら、その旨を最後の報告に書く（シェルの設定ファイルは勝手に直さない）。
+8. 人間に 2 つ聞く。どちらも分からなければ空のままでよい。
+   - Android Studio で開いているプロジェクトのルートの絶対パス（PROJECT）
+   - デバッグするアプリの applicationId（PACKAGE。例 com.example.app）
+9. MCP を登録する。自分が動いているクライアントに合わせて選ぶ。両方使うなら両方実行する。空の値の引数は付けない。
+   - Cursor: `bash scripts/setup.sh mcp --cursor --project "<PROJECT>" --package "<PACKAGE>"`
+   - Claude Code: `bash scripts/setup.sh mcp --claude --project "<PROJECT>" --package "<PACKAGE>"`
+   - Cursor の場合は、人間に「Cursor の設定の MCP で android-studio-debug を再読み込みしてください」と頼む。
+10. スキルを置く。
+   - Cursor: `bash scripts/setup.sh skills --dest "$HOME/.cursor/skills"`
+   - Claude Code: `bash scripts/setup.sh skills --dest "$HOME/.claude/skills"`
+11. `bash scripts/setup.sh verify` を実行する。
+   - 最後の行が `SETUP COMPLETE` なら完了。
+   - `plugin version` の確認で失敗したら、Android Studio が古いプラグインのまま動いている。手順 6 に戻って再起動を頼み、もう一度 verify する。
+   - `endpoint.json` や `GET /health` で失敗したら、Android Studio が起動しているか、プロジェクトを開いているかを人間に確かめてもらい、もう一度 verify する。
+12. 人間に短く報告する。入れたプラグインのバージョン、退避したもののパス、MCP とスキルの登録先、PATH の警告の有無、verify の結果。token の値は書かない。
 ```
-cd ide-plugin
-./gradlew buildPlugin
+
+`scripts/setup.sh` は何度実行しても安全です。同じものが入っていれば何も変えません。違うものがあれば `~/.android-debug-bridge/backups/<名前>-<日時>` に移してから入れ替えます。
+
+## 手でセットアップする
+
+### macOS と Linux
+
+リポジトリのルートで順に実行します。
+
+```bash
+bash scripts/setup.sh check      # 前提条件を確かめる
+bash scripts/setup.sh build      # ビルドとテスト
+bash scripts/setup.sh install    # plugins に入れる（既存は退避）
+# ここで Android Studio を完全に終了して起動し直し、プロジェクトを開く
+bash scripts/setup.sh cli        # ~/.local/bin/asdbg を作る
+bash scripts/setup.sh mcp --cursor --project /path/to/project --package com.example.app
+bash scripts/setup.sh skills --dest ~/.cursor/skills
+bash scripts/setup.sh verify     # SETUP COMPLETE と出れば終わり
 ```
 
-`ide-plugin/build/distributions/android-debug-bridge-0.1.8.zip` ができる。この zip を Android Studio の plugins に展開し、Android Studio を再起動する。起動後に `~/.android-debug-bridge/endpoint.json` と `token` ができる。
+スクリプトを使わない場合の中身は次のとおりです。
 
-## CLI
+1. ビルドします。`JAVA_HOME` には Android Studio の JBR を入れます。macOS なら `"/Applications/Android Studio.app/Contents/jbr/Contents/Home"`、Linux なら `<Android Studio>/jbr` です。
 
+   ```bash
+   cd ide-plugin
+   JAVA_HOME="<JBR>" ./gradlew buildPlugin test
+   ```
+
+   `ide-plugin/build/distributions/android-debug-bridge-<version>.zip` ができます。Android Studio の場所が標準でなければ、`-PandroidStudioPath=<場所>` を付けるか、`ANDROID_STUDIO_PATH` を入れます。
+
+2. zip を plugins フォルダに展開します。前のバージョンの `android-debug-bridge` フォルダがあれば、先に plugins の外へ移します。plugins フォルダの名前は Android Studio の `product-info.json` の `dataDirectoryName` で決まります。
+
+   | OS | plugins フォルダ |
+   |---|---|
+   | macOS | `~/Library/Application Support/Google/<dataDirectoryName>/plugins` |
+   | Linux | `~/.local/share/Google/<dataDirectoryName>` |
+   | Windows | `%APPDATA%\Google\<dataDirectoryName>\plugins` |
+
+   Android Studio の Settings > Plugins > 歯車 > Install Plugin from Disk で zip を選んでも同じです。
+
+3. Android Studio を再起動します。起動すると `~/.android-debug-bridge/endpoint.json` と `token` ができます。
+
+4. CLI はそのまま `python3 cli/asdbg.py` で動きます。短く `asdbg` で呼びたいときは `ln -s "$PWD/cli/asdbg.py" ~/.local/bin/asdbg` します。
+
+5. MCP とスキルは「[MCP](#mcp)」と「[エージェント用のスキル](#エージェント用のスキル)」を見てください。
+
+### Windows で入れる
+
+`scripts/setup.sh` は Windows では動きません。PowerShell で次を行います。
+
+1. ビルドします。
+
+   ```powershell
+   cd ide-plugin
+   $env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
+   .\gradlew.bat buildPlugin test
+   ```
+
+   Android Studio が別の場所なら `$env:ANDROID_STUDIO_PATH` に入れます。
+
+2. Android Studio の Settings > Plugins > 歯車 > Install Plugin from Disk で `ide-plugin\build\distributions\android-debug-bridge-<version>.zip` を選び、再起動します。
+3. CLI は `python cli\asdbg.py doctor` で確かめます。MCP の設定では `command` を `python`、`args` を `server.py` の絶対パスにします。
+
+## 動いているか確かめる
+
+Android Studio を起動してプロジェクトを開いてから、次を実行します。
+
+```bash
+asdbg doctor                     # または python3 cli/asdbg.py doctor
+bash scripts/setup.sh verify     # self-check、MCP の応答、doctor をまとめて行う
 ```
+
+`asdbg doctor` は読み取りだけを行います。ブレークポイントやセッションには触りません。token の値も表示しません。次を確かめます。
+
+- `endpoint.json` があり、待ち受けが `127.0.0.1` であること
+- token ファイルがあり、権限が 600 であること
+- `GET /health` が答え、動いているプラグインのバージョン（`pluginVersion`）
+- token が受け付けられること
+
+すべて通ると `"ok": true` を返し、終了コードは 0 です。
+
+Android Studio の `idea.log`（Help > Show Log）に `asdbg listening` の行があれば、プラグインは起動しています。
+
+## 主な使い方
+
+CLI は、Android Studio で開いているプロジェクトのルートを `ANDROID_STUDIO_PROJECT` で受け取ります。無ければカレントディレクトリを使います。attach するアプリは `--package` か `ASDBG_PACKAGE` で渡します。決まった既定値はありません。
+
+```bash
 export ANDROID_STUDIO_PROJECT="/path/to/project"
-python3 cli/asdbg.py bp-add app/src/main/java/com/example/Main.kt 42
-python3 cli/asdbg.py bp-list
-python3 cli/asdbg.py start app
-python3 cli/asdbg.py control WAIT_FOR_PAUSE --timeout 60000
-python3 cli/asdbg.py stack
-python3 cli/asdbg.py vars
-python3 cli/asdbg.py control STEP_OVER
-python3 cli/asdbg.py control RESUME
+export ASDBG_PACKAGE="com.example.app"
+
+asdbg bp-add app/src/main/java/com/example/app/MainActivity.kt 42
+asdbg bp-list
+asdbg attach --serial <端末のシリアル> --timeout 60000   # 動いているアプリに付ける
+asdbg control WAIT_FOR_PAUSE --timeout 60000 --snapshot  # 止まるまで待つ
+asdbg stack
+asdbg vars
+asdbg step over
+asdbg control RESUME
+asdbg detach
 ```
+
+- 行番号は 1 から数えます。ファイルはプロジェクトルートからの相対パスです。
+- `--timeout` はすべてミリ秒です。30 秒なら `30000` です。
+- `start <configuration>` は Run Configuration を Debug で起動します。多くの場合アプリを入れ直すので、動いているアプリには `attach` を使います。
+- サブコマンドの一覧は `asdbg tools`、各コマンドの引数は `asdbg <command> -h` で見られます。
+- アプリを kill して起動し直す試験では、`attach-wait --serial <serial> --after-kill` で古いセッションを止めてから付け直せます。2 段階で止める位置を変えたいときは `restoration-debug --serial <serial> --file <file> --bp1-line <n> --bp2-line <m> --once` を使います。
+
+### 止まったことを知らせる（pause hooks）
+
+止まるたびに、止まった場所（file、line、class、method、thread など）を JSON で知らせます。変数の値は入れません。初期状態では止めてあります。
+
+```bash
+asdbg webhook enable                       # イベントファイルに書き始める
+asdbg watch --once --timeout 600000        # 次に止まったら 1 行出して終わる
+asdbg webhook set --command "/usr/bin/say paused"   # 止まるたびにコマンドを実行する
+asdbg webhook set --url http://127.0.0.1:8787/asdbg --header-env Authorization=MY_HOOK_TOKEN
+asdbg webhook test                         # 設定した全部の経路へ見本を送る
+asdbg webhook show
+```
+
+設定は `~/.android-debug-bridge/webhook.json` に保存されます。キーの意味は「[止まったことを知らせる（pause hooks）](#止まったことを知らせるpause-hooks)」の詳しい仕様にあります。
+
+### 値を書き換える（set-value）
+
+止まっている間に、ローカル変数やフィールドの値を書き換えられます。
+
+```bash
+asdbg set response.result.code --int 200
+asdbg set this.state --enum DONE --resume
+asdbg resume-with --json '[{"path":"a.code","value":{"int":"200"}},{"path":"a.ok","value":{"boolean":true}}]'
+```
+
+これはアプリの動きを本当に変えます。「[セキュリティ](#セキュリティ)」も読んでください。
+
+## MCP
+
+MCP サーバは `mcp-adapter/server.py` です。stdio の JSON-RPC で動き、Python の標準ライブラリだけを使います。サーバ名は `android-studio-debug` にします。
+
+Cursor では `~/.cursor/mcp.json` に次を足します。`bash scripts/setup.sh mcp --cursor` でも同じものを書きます（既存のファイルは退避します）。
+
+```json
+{
+  "mcpServers": {
+    "android-studio-debug": {
+      "command": "python3",
+      "args": ["/absolute/path/to/android-debug-bridge/mcp-adapter/server.py"],
+      "env": {
+        "ANDROID_STUDIO_PROJECT": "/path/to/project",
+        "ASDBG_PACKAGE": "com.example.app"
+      }
+    }
+  }
+}
+```
+
+Cursor ではこのサーバが `user-android-studio-debug` という名前で見えます。
+
+Claude Code では次を実行します。`bash scripts/setup.sh mcp --claude` でも同じです。
+
+```bash
+claude mcp add --scope user -e ANDROID_STUDIO_PROJECT=/path/to/project -e ASDBG_PACKAGE=com.example.app \
+  android-studio-debug -- python3 /absolute/path/to/android-debug-bridge/mcp-adapter/server.py
+```
+
+`env` はどちらも省けます。省いたときは、ツールの `projectPath` と `package` 引数で毎回渡します。
+
+ツール: `bp_add`、`bp_list`、`bp_update`、`bp_remove`、`bp_clear`、`attach`、`start`、`sessions`、`mute`、`control`、`threads`、`snapshot`、`stack`、`variables`、`evaluate`、`set_value`、`webhook_get`、`webhook_set`、`webhook_test`、`wait_pause_event`。
+
+- `control` の action は CLI と同じです。`SUSPEND_THREAD`、`RESUME_THREAD`、`STEP_*` は `thread`、`RUN_TO_LINE` は `file` と `line`、`SELECT_FRAME` は `frameIndex` と `thread` を取ります。`DETACH` も使えます。
+- `control` に `action: "WAIT_FOR_PAUSE"` と `snapshot: true` を渡すと、止まったときに snapshot が付きます。読めなかったときは `snapshotError` が付きます。
+- `snapshot` の引数は `frameIndex`、`depth`、`maxChildren`、`maxString`、`maxNodes`、`thread`、`snapshotTimeout`、`toString` です。
+- `attach` は `serial` が必須です。`package` が無ければサーバの `ASDBG_PACKAGE` を使い、それも無ければエラーを返します。`waitReady: true` で Android Studio の準備を待ちます。
+- `webhook_get`、`webhook_set`、`webhook_test` は CLI の `webhook show`、`set`、`test` と同じです。`webhook_set` は `webhook.json` と同じキーを取ります。
+- `wait_pause_event` は `pause-events.jsonl` に次の行が来るまで待って返します。`timeout` はミリ秒（既定 60000、最大 600000）です。
+- `timeout` と `snapshotTimeout` はミリ秒です。
+
+## エージェント用のスキル
+
+`skills/` に、エージェント向けの手順書を 2 つ置いています。[agentskills.io](https://agentskills.io) の形式です。
+
+| スキル | 使う場面 |
+|---|---|
+| `skills/android-studio-debug/SKILL.md` | シェルから `asdbg` CLI でデバッグするとき |
+| `skills/android-studio-debug-mcp/SKILL.md` | MCP の `android-studio-debug` ツールでデバッグするとき |
+
+`bash scripts/setup.sh skills --dest <スキルのフォルダ>` でコピーします。Cursor なら `~/.cursor/skills`、Claude Code なら `~/.claude/skills` です。同じ名前のスキルが既にあれば退避してから置きます。
+
+## 困ったとき
+
+### ブレークポイントで止まらない、または止まったあと固まる
+
+Android Studio の Settings > Build, Execution, Deployment > Debugger > Data Views > Java で、次の 2 つを外すと直ることがあります。
+
+- Enable alternative view for Collections classes
+- Enable 'toString()' object view
+
+どちらも、止まったときに Android Studio がアプリの中でメソッドを呼びます。アプリによっては、その呼び出しが止まったスレッドのロックを待って戻らなくなります。
+
+あわせて、ブレークポイントの Suspend を Thread にすると、ほかのスレッドが動き続けるので固まりにくくなります。`asdbg bp-add <file> <line> --suspend thread` か、既存のものなら `asdbg bp-update <id> --suspend thread` です。Thread で止めたときは「[suspend=thread で止めたとき](#suspendthread-で止めたとき)」を読んでください。
+
+### そのほか
+
+| 症状 | 確かめること |
+|---|---|
+| `bridge endpoint is missing` | プラグインを入れたあと Android Studio を再起動したか。`asdbg doctor` で確かめる。 |
+| `plugin version` が合わない | Android Studio が古いプラグインのまま動いている。完全に終了して起動し直す。 |
+| `set X-Project-Path` で 400 | `ANDROID_STUDIO_PROJECT`（MCP なら `projectPath`）を、Android Studio で開いているプロジェクトのルートにする。 |
+| `package is required` | `--package` か `ASDBG_PACKAGE`（MCP なら `package`）を渡す。 |
+| attach で 404 | アプリのプロセスが動いていない。`--wait-for-process` を付けるか、アプリを起動してから attach する。 |
+| ブレークポイントが `pending` のまま | そのコードをまだ通っていない。インデックス中なら `attach --wait-ready` を使う。 |
+| `session is running` | 止まっていない。`control WAIT_FOR_PAUSE` で止まるのを待つ。 |
+| Gradle が Android Studio を見つけない | `-PandroidStudioPath=<場所>` か `ANDROID_STUDIO_PATH` を入れる。 |
+| Gradle が Java のバージョンで失敗する | `JAVA_HOME` を Android Studio の JBR にする。 |
+| Cursor で MCP が `error` のまま | `mcp.json` の `server.py` のパスが絶対パスか確かめ、MCP を再読み込みする。 |
+
+## セキュリティ
+
+- ブリッジは `127.0.0.1` だけで待ち受けます。ほかのマシンからはつながりません。
+- `/health` 以外の API には token が要ります。token は Android Studio が初回起動時に 32 バイトの乱数から作り、`~/.android-debug-bridge/token` に権限 600 で保存します。マシンごとに別の値になります。token をチャット、イシュー、リポジトリに書かないでください。
+- `endpoint.json` には URL と token ファイルのパスだけが入ります。token の値は入りません。
+- `eval` と `snapshot --to-string` はアプリの中でコードを動かします。CLI は `--allow` を付けたときだけ送ります。
+- `set`、`resume-with`、`set_value` はアプリの状態を本当に書き換えます。お金、外部システム、端末の設定が絡む処理では、試験の意図した範囲だけに使ってください。本番の端末や本番のデータでは使わないでください。
+- snapshot、変数、書き換えの結果には個人情報や識別子が入ることがあります。名前が password、secret、token、apiKey、credential に当たる値は `***` にしますが、それ以外は伏せません。外に貼るときは、カード番号、token、端末 ID、シリアルを末尾 4 桁まで伏せてください。
+- pause hooks の URL やヘッダに秘密を書くときは `headersFromEnv` を使い、値は環境変数に置きます。`webhook show` ではヘッダの値と URL のパスが `***` になります。
+- 社内の接続先、パスワード、端末の情報はこのリポジトリに書きません。必要なものは各チームの Wiki を参照してください。
+
+## 開発
+
+```bash
+cd ide-plugin
+JAVA_HOME="<Android Studio の JBR>" ./gradlew buildPlugin test
+python3 ../cli/asdbg.py --self-check
+python3 ../mcp-adapter/server.py --self-check
+```
+
+| パス | 中身 |
+|---|---|
+| `ide-plugin/` | Android Studio のプラグイン（Kotlin） |
+| `cli/asdbg.py` | CLI |
+| `mcp-adapter/server.py` | MCP サーバ |
+| `scripts/setup.sh` | セットアップ用スクリプト |
+| `skills/` | エージェント用のスキル |
+
+バージョンは `ide-plugin/build.gradle.kts` の `version`、`PauseHooks.kt` の `ASDBG_VERSION`、`server.py` の `serverInfo.version` の 3 か所にあります。上げるときはそろえてください。
+
+Android Studio 2026.2 に同梱の MCP Server には、デバッガを操作するツール（IntelliJ IDEA の `xdebug_*`）がありません。asdbg はその穴を埋めるために作りました。
+
+## 詳しい仕様
 
 ### ブレークポイントが効いているか
 
@@ -41,8 +348,8 @@ python3 cli/asdbg.py control RESUME
 ### ミュート
 
 ```
-python3 cli/asdbg.py mute on
-python3 cli/asdbg.py mute off --session <id>
+asdbg mute on
+asdbg mute off --session <id>
 ```
 
 Debug ウィンドウの Mute Breakpoints と同じ。ミュートはセッションごとなので、`--session` が無ければ全セッションに掛ける。ミュート中はブレークポイントが `verified` でも止まらない。
@@ -57,16 +364,16 @@ Android Studio の起動直後はプロジェクトが読み込み途中だっ�
 ### 操作の一覧
 
 ```
-python3 cli/asdbg.py threads --frames 5
-python3 cli/asdbg.py thread-suspend "Binder:1234_2"
-python3 cli/asdbg.py thread-resume "Binder:1234_2"
-python3 cli/asdbg.py step over --thread main
-python3 cli/asdbg.py run-to app/src/main/java/com/example/Main.kt 60
-python3 cli/asdbg.py frame 2 --thread main
-python3 cli/asdbg.py bp-update <id> --condition "count > 3" --pass-count 2 --suspend thread
-python3 cli/asdbg.py bp-update <id> --log-expression "amount" --suspend none
-python3 cli/asdbg.py bp-disable <id>
-python3 cli/asdbg.py detach
+asdbg threads --frames 5
+asdbg thread-suspend "Binder:1234_2"
+asdbg thread-resume "Binder:1234_2"
+asdbg step over --thread main
+asdbg run-to app/src/main/java/com/example/Main.kt 60
+asdbg frame 2 --thread main
+asdbg bp-update <id> --condition "count > 3" --pass-count 2 --suspend thread
+asdbg bp-update <id> --log-expression "amount" --suspend none
+asdbg bp-disable <id>
+asdbg detach
 ```
 
 - `threads` は VM の全スレッドを返す。`status`（RUNNING、WAIT、MONITOR など）、`suspended`、`suspendCount`、ブレークポイントで止まったスレッドなら `stoppedHere: true`。`--frames N` で止まっているスレッドの上位 N フレームが付く。
@@ -128,10 +435,10 @@ Debug ウィンドウの操作との対応:
 止まっているスレッドについて、Android Studio のデバッガに出る情報を 1 回で返す。
 
 ```
-python3 cli/asdbg.py snapshot
-python3 cli/asdbg.py snapshot --frame 1 --depth 3
-python3 cli/asdbg.py snapshot --thread main --max-children 20 --max-string 200
-python3 cli/asdbg.py control WAIT_FOR_PAUSE --timeout 60000 --snapshot
+asdbg snapshot
+asdbg snapshot --frame 1 --depth 3
+asdbg snapshot --thread main --max-children 20 --max-string 200
+asdbg control WAIT_FOR_PAUSE --timeout 60000 --snapshot
 ```
 
 返すもの:
@@ -154,13 +461,13 @@ python3 cli/asdbg.py control WAIT_FOR_PAUSE --timeout 60000 --snapshot
 
 ### snapshot の値の扱い
 
-snapshot には会員情報、決済の値、端末の識別子などがそのまま入ることがある。名前が password、secret、token、apiKey、credential に当たる値は `***` にするが、それ以外は伏せない。
+snapshot には個人情報、金額、端末の識別子などがそのまま入ることがある。名前が password、secret、token、apiKey、credential に当たる値は `***` にするが、それ以外は伏せない。
 
 - ブリッジは `127.0.0.1` だけで待ち受け、token が無いと答えない。
 - プラグインと CLI は値を外へ送らない。
-- 結果をチャット、イシュー、外部のサービスに貼るときは、カード番号、POICHI token、端末 ID、シリアルを伏せる。
+- 結果をチャット、イシュー、外部のサービスに貼るときは、カード番号、認証トークン、端末 ID、シリアルを伏せる（末尾 4 桁まで）。
 
-### 値の書き換え（Set Value、0.1.6）
+### 値の書き換え（Set Value）
 
 止まっている間にフレームの値を書き換えられる。プリミティブ、String、null、enum 定数はメソッドを呼ばないので、`suspend=thread` の停止でも使える。`eval` と違って式は実行しないので `--allow` ヘッダは要らない。
 
@@ -168,7 +475,7 @@ snapshot には会員情報、決済の値、端末の識別子などがその�
 
 - フレームのローカル変数（例 `amount`）
 - `this` のフィールド（例 `this.payment.amount`）
-- フィールドや配列要素をたどったパス（例 `responsePay.result.code`、`arr[2]`、`grid[0][1].cell`）
+- フィールドや配列要素をたどったパス（例 `response.result.code`、`arr[2]`、`grid[0][1].cell`）
 - 完全修飾の静的フィールド（例 `com.example.Foo.FIELD`）
 
 値（1 つだけ指定する）:
@@ -183,7 +490,7 @@ snapshot には会員情報、決済の値、端末の識別子などがその�
 
 ```
 # 1 つ書く
-asdbg set responsePay.result.code --int 200
+asdbg set response.result.code --int 200
 
 # 書いてそのまま再開する
 asdbg set this.payment.amount --long 0 --resume
@@ -213,12 +520,12 @@ asdbg resume-with --json '[{"path":"a.code","value":{"int":"200"}},{"path":"a.pa
 
 リスク:
 
-- これは稼働中の決済フローの状態を書き換える。`responsePay.result.code` のような値を変えると、後続の処理が実機で本当に分岐する。試験の意図した範囲だけに使う。
-- 書き込む値・返る値には会員情報や決済の値が入りうる。外に貼らない。
+- これは動いているアプリの状態を書き換える。`response.result.code` のような値を変えると、後続の処理が実機で本当に分岐する。お金や外部システムが絡む処理では特に、試験の意図した範囲だけに使う。
+- 書き込む値と返る値には個人情報や金額が入りうる。外に貼らない。
 
 `eval` は対象プロセスで式を実行する。`--allow` が無いと送らない。削除できるブレークポイントは、このブリッジが作ったものだけ。
 
-### 止まったことを知らせる（pause hooks、0.1.7）
+### 止まったことを知らせる（pause hooks）
 
 デバッガが止まるたびに、止まった場所を外へ知らせる。ブレークポイント、ステップの終わり、例外・メソッド・フィールドのブレークポイント、手動の Pause のどれでも動く。`suspend=thread` の停止も拾う。初期状態では止めてある。
 
@@ -231,7 +538,7 @@ asdbg resume-with --json '[{"path":"a.code","value":{"int":"200"}},{"path":"a.pa
 JSON の例:
 
 ```
-{"event":"paused","kind":"breakpoint","source":"jdi","sessionId":"a1b2c3","sessionName":"app","project":"selfregi-for-android","file":"app/src/main/java/com/example/MainActivity.kt","line":42,"class":"com.example.MainActivity","method":"onCreate","thread":"main","threadLevel":true,"policy":"thread","contextPolicy":"thread","breakpointPolicy":"thread","breakpointId":"5f0c...","timestamp":"2026-10-26T16:40:00.123+09:00","pluginVersion":"0.1.8","seq":1}
+{"event":"paused","kind":"breakpoint","source":"jdi","sessionId":"a1b2c3","sessionName":"app","project":"my-app","file":"app/src/main/java/com/example/MainActivity.kt","line":42,"class":"com.example.MainActivity","method":"onCreate","thread":"main","threadLevel":true,"policy":"thread","contextPolicy":"thread","breakpointPolicy":"thread","breakpointId":"5f0c...","timestamp":"2026-10-26T16:40:00.123+09:00","pluginVersion":"0.1.9","seq":1}
 ```
 
 - `kind` は `breakpoint`、`step`、`exception`、`method`、`field`、`pause`、`run_to_line`、`other` のどれか。
@@ -301,24 +608,3 @@ asdbg watch --once --bridge --timeout 60000
 
 エージェントから使うときは、`watch --once` か MCP の `wait_pause_event` で待ち、返ってきた `file` と `line` を見て次の操作（`snapshot`、`set` など）をする。
 
-## MCP
-
-Cursor の MCP 設定に次を足す。
-
-```
-python3 /Users/shinma.takahashi/Develop/selfregi/android-debug-bridge/mcp-adapter/server.py
-```
-
-ツール: `bp_add`、`bp_list`、`bp_update`、`bp_remove`、`bp_clear`、`attach`、`start`、`sessions`、`mute`、`control`、`threads`、`snapshot`、`stack`、`variables`、`evaluate`、`set_value`、`webhook_get`、`webhook_set`、`webhook_test`、`wait_pause_event`。
-
-- `webhook_get`、`webhook_set`、`webhook_test` は CLI の `webhook show`、`set`、`test` と同じ。`webhook_set` は `webhook.json` と同じキーを取る。
-- `wait_pause_event` は `pause-events.jsonl` に次の行が来るまで待って返す。`timeout` はミリ秒（初期 60000）。
-
-- `control` の action は CLI と同じ。`SUSPEND_THREAD`、`RESUME_THREAD`、`STEP_*` は `thread`、`RUN_TO_LINE` は `file` と `line`、`SELECT_FRAME` は `frameIndex` と `thread` を取る。`DETACH` も使える。
-- `attach` は `waitReady: true` で準備を待つ。
-
-- `snapshot` は CLI の `snapshot` と同じ。引数は `frameIndex`、`depth`、`maxChildren`、`maxString`、`maxNodes`、`thread`、`snapshotTimeout`、`toString`。
-- `control` に `action: "WAIT_FOR_PAUSE"` と `snapshot: true` を渡すと、止まったときに `snapshot` が付く。読めなかったときは `snapshotError` が付く。
-- `timeout` と `snapshotTimeout` はミリ秒。
-
-公式の Python MCP SDK は使っていない。stdio の JSON-RPC だけで足りる。
