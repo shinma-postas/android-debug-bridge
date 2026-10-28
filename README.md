@@ -13,24 +13,59 @@ asdbg は、Android Studio が持っているデバッグセッションを、�
 
 ## 目次
 
-1. [前提条件](#前提条件)
-2. [エージェントに任せてセットアップする](#エージェントに任せてセットアップする)
-3. [手でセットアップする](#手でセットアップする)
-4. [動いているか確かめる](#動いているか確かめる)
-5. [主な使い方](#主な使い方)
-6. [MCP](#mcp)
-7. [エージェント用のスキル](#エージェント用のスキル)
-8. [困ったとき](#困ったとき)
-9. [セキュリティ](#セキュリティ)
-10. [開発](#開発)
-11. [詳しい仕様](#詳しい仕様)
+1. [対応する Android Studio のバージョン](#対応する-android-studio-のバージョン)
+2. [前提条件](#前提条件)
+3. [エージェントに任せてセットアップする](#エージェントに任せてセットアップする)
+4. [手でセットアップする](#手でセットアップする)
+5. [動いているか確かめる](#動いているか確かめる)
+6. [主な使い方](#主な使い方)
+7. [MCP](#mcp)
+8. [エージェント用のスキル](#エージェント用のスキル)
+9. [困ったとき](#困ったとき)
+10. [セキュリティ](#セキュリティ)
+11. [開発](#開発)
+12. [詳しい仕様](#詳しい仕様)
+
+## 対応する Android Studio のバージョン
+
+セットアップを始める前に、まず Android Studio のバージョンが対応範囲に入っているかを確かめてください。範囲外の Android Studio にはプラグインが入らないか、入っても読み込まれません。
+
+| 項目 | 内容 |
+|---|---|
+| ビルド番号 | `262.9437` 以降、`262.*` まで |
+| リリース名 | Android Studio Rabbit（2026.2 系）。Rabbit 1（2026.2.1）以降の 2026.2.x |
+| 動作を確かめた版 | Android Studio Rabbit 1 2026.2.1（`AI-262.9437.185.2621.16467767`） |
+| 対応しない版 | Quail（2026.1.x、ビルド 261.*）より前と、2026.3 系（ビルド 263.*）以降 |
+
+範囲は `ide-plugin/build.gradle.kts` の `ideaVersion` にある `sinceBuild` と `untilBuild` で決まります（`plugin.xml` の `idea-version` もビルド時にこの値になります）。Rabbit 2（2026.2.2、ビルド 262.10968 など）も範囲に入りますが、まだ動作は確かめていません。
+
+バージョンの確かめ方は次のどちらかです。
+
+- Android Studio の画面で見る。macOS は Android Studio > About Android Studio、Linux と Windows は Help > About。`Build #AI-262.9437.185...` の `AI-` の後ろがビルド番号です。
+- `product-info.json` の `buildNumber` を見る。Android Studio を起動していなくても読めます。
+
+  ```bash
+  # macOS
+  grep '"buildNumber"' "/Applications/Android Studio.app/Contents/Resources/product-info.json"
+  # Linux（Android Studio を置いたディレクトリ）
+  grep '"buildNumber"' /opt/android-studio/product-info.json
+  ```
+
+  ```powershell
+  # Windows
+  Select-String '"buildNumber"' "C:\Program Files\Android\Android Studio\product-info.json"
+  ```
+
+`buildNumber` が `262.` で始まり、2 つ目の数字が `9437` 以上なら対応しています。`bash scripts/setup.sh check` も最初にこの確認を行い、範囲外ならほかを調べずに止まります。
+
+対応範囲を変えるときは、`build.gradle.kts` の `sinceBuild` と `untilBuild`、この節の表、下の「エージェントに任せてセットアップする」のプロンプトの手順 1 をそろえて直してください。
 
 ## 前提条件
 
 | 項目 | 内容 |
 |---|---|
 | OS | macOS または Linux。`scripts/setup.sh` はこの 2 つで動きます。Windows は「[Windows で入れる](#windows-で入れる)」の手順を使います。 |
-| Android Studio | 2026.2 系（ビルド番号 262.9437 以降、262.* まで）。範囲は `ide-plugin/build.gradle.kts` の `sinceBuild` と `untilBuild` で決まります。 |
+| Android Studio | Rabbit（2026.2 系、ビルド番号 262.9437 以降、262.* まで）。詳しくは「[対応する Android Studio のバージョン](#対応する-android-studio-のバージョン)」を見てください。 |
 | JDK | ビルドに JDK 21 以上が要ります。Android Studio に入っている JBR を使うので、別に入れる必要はありません。 |
 | Python | 3.8 以上。CLI と MCP サーバは標準ライブラリだけで動きます。pip は使いません。 |
 | コマンド | `git`、`python3`、`unzip`。`adb` は `attach-wait` と `restoration-debug` を使うときだけ要ります。`attach` そのものは Android Studio の adb を使います。 |
@@ -41,7 +76,7 @@ Android Studio が標準の場所に無いときは、環境変数 `ANDROID_STUD
 
 ## エージェントに任せてセットアップする
 
-次のコードブロックを、そのまま Cursor や Claude Code などのエージェントに貼ってください。エージェントは途中で 1 回だけ、Android Studio の再起動を頼んできます。最後に `SETUP COMPLETE` と出れば終わりです。
+次のコードブロックを、そのまま Cursor や Claude Code などのエージェントに貼ってください。エージェントは最初に Android Studio のバージョンを確かめ、範囲外ならそこで止まって知らせます。途中で 1 回だけ、Android Studio の再起動を頼んできます。最後に `SETUP COMPLETE` と出れば終わりです。
 
 ```text
 asdbg（Android Studio debug bridge）をこのマシンにセットアップしてください。最後の確認が通るまで、次の手順を順に進めてください。
@@ -54,34 +89,42 @@ asdbg（Android Studio debug bridge）をこのマシンにセットアップし
 - コマンドが失敗したら、そこで止まって出力をそのまま人間に見せ、どうするか聞く。sudo は使わない。
 
 手順:
-1. OS を `uname -s` で確かめる。Darwin か Linux なら次へ進む。それ以外（Windows など）なら、README の「Windows で入れる」の手順を人間と一緒に進め、この手順はそこで終える。
-2. リポジトリを用意する。人間に置き場所の希望を聞き、無ければ "$HOME/android-debug-bridge" にする。この場所を ASDBG_DIR とする。
+1. ほかの作業より先に、Android Studio のバージョンが対応範囲に入っているかを確かめる。対応範囲はビルド番号 262.9437 以降、262.* まで（Android Studio Rabbit、2026.2.1 以降の 2026.2.x）。
+   - product-info.json の buildNumber を読む。Android Studio の起動や終了はしない。
+     - macOS: `grep '"buildNumber"' "/Applications/Android Studio.app/Contents/Resources/product-info.json"`（無ければ "$HOME/Applications/Android Studio.app" も見る）
+     - Linux: Android Studio を置いたディレクトリの product-info.json（/opt/android-studio、/usr/local/android-studio、$HOME/android-studio、/snap/android-studio/current/android-studio など）
+     - Windows: `Select-String '"buildNumber"' "C:\Program Files\Android\Android Studio\product-info.json"`
+   - 見つからなければ、人間に Android Studio の場所を聞くか、About 画面（macOS は Android Studio > About Android Studio、それ以外は Help > About）の `Build #AI-...` を教えてもらう。
+   - buildNumber が `262.` で始まり、2 つ目の数字が 9437 以上なら次へ進む。
+   - それ以外なら、ここで止まる。clone、ビルド、インストールはしない。見つかったビルド番号と対応範囲を人間に伝え、対応する Android Studio を入れるかどうかを聞く。
+2. OS を `uname -s` で確かめる。Darwin か Linux なら次へ進む。それ以外（Windows など）なら、README の「Windows で入れる」の手順を人間と一緒に進め、この手順はそこで終える。
+3. リポジトリを用意する。人間に置き場所の希望を聞き、無ければ "$HOME/android-debug-bridge" にする。この場所を ASDBG_DIR とする。
    - ASDBG_DIR に既に clone があれば `git -C "$ASDBG_DIR" status --short` が空であることを確かめてから `git -C "$ASDBG_DIR" pull --ff-only` する。空でなければ止まって人間に聞く。
    - 無ければ `git clone https://github.com/shinma-postas/android-debug-bridge.git "$ASDBG_DIR"` する。権限が無くて失敗したら、人間にアクセス権を頼む。
    - 以降のコマンドはすべて `cd "$ASDBG_DIR"` してから実行する。
-3. `bash scripts/setup.sh check` を実行する。OS、Android Studio の場所とビルド番号、JBR、python3、plugins フォルダを自動で調べる。
+4. `bash scripts/setup.sh check` を実行する。Android Studio の場所とビルド番号を最初に調べ、続けて JBR、python3、plugins フォルダを調べる。
    - Android Studio が見つからないと言われたら、人間に場所を聞いて `bash scripts/setup.sh check --studio "<場所>"` で再実行する。以降のコマンドにも同じ `--studio` を付ける。
-   - バージョンが範囲外と言われたら止まって人間に伝える。
-4. `bash scripts/setup.sh build` を実行する。プラグインのビルドとテストを行う。数分かかることがある。
-5. `bash scripts/setup.sh install` を実行する。古い asdbg プラグインがあれば退避してから入れる。退避先のパスを控える。
-6. 人間に次のとおり伝えて、返事が来るまで待つ。先へ進まない。
+   - バージョンが範囲外と言われたら止まって人間に伝える（手順 1 で見た Android Studio と別のものを見ていないかも確かめる）。
+5. `bash scripts/setup.sh build` を実行する。プラグインのビルドとテストを行う。数分かかることがある。
+6. `bash scripts/setup.sh install` を実行する。古い asdbg プラグインがあれば退避してから入れる。退避先のパスを控える。
+7. 人間に次のとおり伝えて、返事が来るまで待つ。先へ進まない。
    「Android Studio を完全に終了してから起動し直し、デバッグしたいプロジェクトを開いてください。終わったら『再起動した』と返事してください。」
-7. `bash scripts/setup.sh cli` を実行する。~/.local/bin/asdbg ができる。PATH に無いと警告が出たら、その旨を最後の報告に書く（シェルの設定ファイルは勝手に直さない）。
-8. 人間に 2 つ聞く。どちらも分からなければ空のままでよい。
+8. `bash scripts/setup.sh cli` を実行する。~/.local/bin/asdbg ができる。PATH に無いと警告が出たら、その旨を最後の報告に書く（シェルの設定ファイルは勝手に直さない）。
+9. 人間に 2 つ聞く。どちらも分からなければ空のままでよい。
    - Android Studio で開いているプロジェクトのルートの絶対パス（PROJECT）
    - デバッグするアプリの applicationId（PACKAGE。例 com.example.app）
-9. MCP を登録する。自分が動いているクライアントに合わせて選ぶ。両方使うなら両方実行する。空の値の引数は付けない。
+10. MCP を登録する。自分が動いているクライアントに合わせて選ぶ。両方使うなら両方実行する。空の値の引数は付けない。
    - Cursor: `bash scripts/setup.sh mcp --cursor --project "<PROJECT>" --package "<PACKAGE>"`
    - Claude Code: `bash scripts/setup.sh mcp --claude --project "<PROJECT>" --package "<PACKAGE>"`
    - Cursor の場合は、人間に「Cursor の設定の MCP で android-studio-debug を再読み込みしてください」と頼む。
-10. スキルを置く。
+11. スキルを置く。
    - Cursor: `bash scripts/setup.sh skills --dest "$HOME/.cursor/skills"`
    - Claude Code: `bash scripts/setup.sh skills --dest "$HOME/.claude/skills"`
-11. `bash scripts/setup.sh verify` を実行する。
+12. `bash scripts/setup.sh verify` を実行する。
    - 最後の行が `SETUP COMPLETE` なら完了。
-   - `plugin version` の確認で失敗したら、Android Studio が古いプラグインのまま動いている。手順 6 に戻って再起動を頼み、もう一度 verify する。
+   - `plugin version` の確認で失敗したら、Android Studio が古いプラグインのまま動いている。手順 7 に戻って再起動を頼み、もう一度 verify する。
    - `endpoint.json` や `GET /health` で失敗したら、Android Studio が起動しているか、プロジェクトを開いているかを人間に確かめてもらい、もう一度 verify する。
-12. 人間に短く報告する。入れたプラグインのバージョン、退避したもののパス、MCP とスキルの登録先、PATH の警告の有無、verify の結果。token の値は書かない。
+13. 人間に短く報告する。入れたプラグインのバージョン、退避したもののパス、MCP とスキルの登録先、PATH の警告の有無、verify の結果。token の値は書かない。
 ```
 
 `scripts/setup.sh` は何度実行しても安全です。同じものが入っていれば何も変えません。違うものがあれば `~/.android-debug-bridge/backups/<名前>-<日時>` に移してから入れ替えます。
@@ -93,7 +136,7 @@ asdbg（Android Studio debug bridge）をこのマシンにセットアップし
 リポジトリのルートで順に実行します。
 
 ```bash
-bash scripts/setup.sh check      # 前提条件を確かめる
+bash scripts/setup.sh check      # Android Studio のバージョンを最初に確かめ、続けて前提条件を確かめる
 bash scripts/setup.sh build      # ビルドとテスト
 bash scripts/setup.sh install    # plugins に入れる（既存は退避）
 # ここで Android Studio を完全に終了して起動し直し、プロジェクトを開く

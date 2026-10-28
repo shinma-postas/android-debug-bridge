@@ -2,7 +2,7 @@
 # asdbg のセットアップ。何度実行してもよい（冪等）。
 # macOS と Linux 用。Windows は README の手動手順を使う。
 #
-#   scripts/setup.sh check                 前提条件を確かめる
+#   scripts/setup.sh check                 Android Studio のバージョンを最初に確かめ、続けて前提条件を確かめる
 #   scripts/setup.sh build                 プラグインをビルドしてテストする
 #   scripts/setup.sh install               ビルドした zip を Android Studio の plugins に入れる（既存は退避）
 #   scripts/setup.sh cli                   ~/.local/bin/asdbg を作る
@@ -121,18 +121,31 @@ find_plugins_dir() {
   fi
 }
 
-version_ge() {  # version_ge 262.9437.185 262.9437
-  python3 - "$1" "$2" <<'PY'
-import sys
-a = [int(x) for x in sys.argv[1].split(".")[:3] if x.isdigit()]
-b = [int(x) for x in sys.argv[2].split(".")[:3] if x.isdigit()]
-sys.exit(0 if a[:len(b)] >= b else 1)
-PY
+check_studio_version() {  # 最初に呼ぶ。範囲外ならほかは調べずに止まる
+  local info build since until b1 b2 s1 s2
+  find_studio
+  ok "Android Studio: $STUDIO"
+  info="$(studio_file product-info)"
+  [ -r "$info" ] || die "cannot read $info. Check the Android Studio version in About and compare it with README"
+  build="$(sed -n 's/.*"buildNumber"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$info" | head -1)"
+  since="$(gradle_value sinceBuild)"
+  until="$(gradle_value untilBuild)"
+  [ -n "$build" ] || die "cannot read buildNumber from $info"
+  b1="${build%%.*}"; b2="$(printf '%s' "$build" | cut -d. -f2)"
+  s1="${since%%.*}"; s2="$(printf '%s' "$since" | cut -d. -f2)"
+  if [ "$b1" -lt "$s1" ] 2>/dev/null || { [ "$b1" = "$s1" ] && [ "$b2" -lt "$s2" ] 2>/dev/null; }; then
+    die "Android Studio build $build is older than sinceBuild $since. Supported: $since - $until (see README: 対応する Android Studio のバージョン)"
+  fi
+  case "$until" in
+    *'.*') [ "$b1" = "${until%%.*}" ] || die "Android Studio build $build is outside untilBuild $until. Supported: $since - $until (see README: 対応する Android Studio のバージョン)" ;;
+  esac
+  ok "Android Studio build: $build is supported ($since - $until)"
 }
 
 cmd_check() {
   local fail=0
   ok "OS: $OS ($(uname -m))"
+  check_studio_version
   for tool in git python3 unzip; do
     if command -v "$tool" >/dev/null 2>&1; then ok "$tool: $(command -v "$tool")"; else warn "$tool is missing"; fail=1; fi
   done
@@ -142,17 +155,7 @@ cmd_check() {
       || { warn "python3 3.8 or newer is needed"; fail=1; }
   fi
   command -v adb >/dev/null 2>&1 && ok "adb: $(command -v adb)" || warn "adb is not on PATH. attach-wait and restoration-debug need it"
-  find_studio
-  ok "Android Studio: $STUDIO"
-  local build since until jh
-  build="$(product_field buildNumber)"
-  since="$(gradle_value sinceBuild)"
-  until="$(gradle_value untilBuild)"
-  ok "Android Studio build: $build ($(product_field version))"
-  if ! version_ge "$build" "$since"; then warn "build $build is older than sinceBuild $since"; fail=1; fi
-  case "$until" in
-    *'.*') [ "${build%%.*}" = "${until%%.*}" ] || { warn "build $build is outside untilBuild $until"; fail=1; } ;;
-  esac
+  local jh
   jh="$(java_home)"
   if [ -x "$jh/bin/java" ]; then
     local jv
